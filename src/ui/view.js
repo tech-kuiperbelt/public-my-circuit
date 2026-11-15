@@ -20,6 +20,7 @@ import {
   frameScreenRect
 } from './frame.js';
 import { TOGGLE_SWITCH_RADIUS_RATIO } from './hit.js';
+import { getOscillationHighlight, oscillationPulse } from './oscillation-highlight.js';
 
 export const MIN_SCALE = 0.5;
 export const MAX_SCALE = 6;
@@ -270,7 +271,7 @@ function isSelectedWire(selection, wireId) {
 
 // 交叉处画桥拱：上层线隆起，下层线保持连续（不断开）。
 // 同一上层线的多个相邻交叉合并：上升 → 跨越整组 → 下降。
-function drawBridges(ctx, state, view, selection) {
+function drawBridges(ctx, state, view, selection, oscillatingWires, pulse) {
   const groups = groupBridgeCrossings(state, findCrossings(state));
   for (const group of groups) {
     const over = state.wires[group.overWireId];
@@ -278,8 +279,9 @@ function drawBridges(ctx, state, view, selection) {
       continue;
     }
     const overSelected = isSelectedWire(selection, group.overWireId);
-    const overColor = overSelected ? ACCENT : WIRE_COLOR;
-    const overWidth = overSelected ? 4.5 : 2;
+    const overOscillating = oscillatingWires && oscillatingWires.has(group.overWireId);
+    const overColor = overOscillating ? pulse.color : overSelected ? ACCENT : WIRE_COLOR;
+    const overWidth = overOscillating ? pulse.width : overSelected ? 4.5 : 2;
     const first = group.items[0];
     const last = group.items[group.items.length - 1];
     const dir = group.overDir;
@@ -287,13 +289,20 @@ function drawBridges(ctx, state, view, selection) {
     const end = { x: last.crossing.point.x + dir.x * BRIDGE_SPAN, y: last.crossing.point.y + dir.y * BRIDGE_SPAN };
 
     // 1) 擦掉上层线在整组交叉处的直线段。
-    eraseSegment(ctx, view, start, end, 7);
+    eraseSegment(ctx, view, start, end, overOscillating && overSelected ? 9 : 7);
 
     // 2) 逐条补回下层线被擦掉的交叉段。
     for (const item of group.items) {
       const underSelected = isSelectedWire(selection, item.underWireId);
-      const underColor = underSelected ? ACCENT : WIRE_COLOR;
-      const underWidth = underSelected ? 4.5 : 2;
+      const underOscillating = oscillatingWires && oscillatingWires.has(item.underWireId);
+      const underColor = underOscillating ? pulse.color : underSelected ? ACCENT : WIRE_COLOR;
+      const underWidth = underOscillating ? pulse.width : underSelected ? 4.5 : 2;
+      if (underSelected && underOscillating) {
+        strokeLocalSegment(ctx, view,
+          { x: item.crossing.point.x - item.underDir.x * BRIDGE_SPAN, y: item.crossing.point.y - item.underDir.y * BRIDGE_SPAN },
+          { x: item.crossing.point.x + item.underDir.x * BRIDGE_SPAN, y: item.crossing.point.y + item.underDir.y * BRIDGE_SPAN },
+          ACCENT, 6.5);
+      }
       strokeLocalSegment(
         ctx,
         view,
@@ -344,12 +353,19 @@ function drawBridges(ctx, state, view, selection) {
       ctx.lineTo(p4.x, p4.y);
       ctx.bezierCurveTo(p5.x, p5.y, p6.x, p6.y, pb.x, pb.y);
     }
+    if (overSelected && overOscillating) {
+      ctx.strokeStyle = ACCENT;
+      ctx.lineWidth = 6.5;
+      ctx.stroke();
+      ctx.strokeStyle = overColor;
+      ctx.lineWidth = overWidth;
+    }
     ctx.stroke();
     ctx.restore();
   }
 }
 
-function drawEndpoints(ctx, state, view) {
+function drawEndpoints(ctx, state, view, oscillatingWires, pulse) {
   for (const wireId of Object.keys(state.wires)) {
     const wire = state.wires[wireId];
     const points = wire.points;
@@ -367,7 +383,8 @@ function drawEndpoints(ctx, state, view) {
       if (item.end.kind === 'free') {
         openCircle(ctx, item.point, view);
       } else if (item.end.kind === 'junction') {
-        solidDot(ctx, item.point, view, WIRE_COLOR, 3);
+        solidDot(ctx, item.point, view,
+          oscillatingWires && oscillatingWires.has(wireId) ? pulse.color : WIRE_COLOR, 3);
       }
     }
   }
@@ -1093,7 +1110,7 @@ function drawPortAnnotations(ctx, view, annotations, selectedPortId) {
   ctx.restore();
 }
 
-function drawWireSelection(ctx, state, view, selection) {
+function drawWireSelection(ctx, state, view, selection, oscillatingWires) {
   if (!selection) {
     return;
   }
@@ -1106,9 +1123,25 @@ function drawWireSelection(ctx, state, view, selection) {
   for (const id of ids) {
     const wire = state.wires[id];
     if (wire) {
-      strokePolyline(ctx, wire.points, view, ACCENT, 4.5);
+      strokePolyline(ctx, wire.points, view, ACCENT,
+        oscillatingWires && oscillatingWires.has(id) ? 6.5 : 4.5);
     }
   }
+}
+
+function drawOscillatingComponents(ctx, state, view, highlight, pulse, definitions) {
+  if (!highlight) return;
+  ctx.save();
+  ctx.strokeStyle = pulse.color;
+  ctx.lineWidth = pulse.width;
+  for (const id of highlight.componentIds) {
+    const component = state.components[id];
+    if (!component) continue;
+    const rect = componentScreenBounds(component, view, { definitions });
+    // Outside the existing body/selection border: names and symbols stay clear.
+    ctx.strokeRect(rect.x - 4, rect.y - 4, rect.width + 8, rect.height + 8);
+  }
+  ctx.restore();
 }
 
 function drawComponentSelection(ctx, state, view, selection, definitionOptions = {}) {
@@ -1508,6 +1541,9 @@ export function drawDefinitionPreview(ctx, width, height, definition, selectedPo
 
 export function render(ctx, width, height, state, view, ui, evaluation) {
   const overlay = ui || {};
+  const highlight = getOscillationHighlight(state, evaluation, overlay.definitions);
+  const oscillatingWires = new Set(highlight ? highlight.wireIds : []);
+  const pulse = oscillationPulse(overlay.oscillationTimeMs, overlay.reducedMotion);
   ctx.save();
   ctx.fillStyle = '#1b1b1b';
   ctx.fillRect(0, 0, width, height);
@@ -1519,9 +1555,13 @@ export function render(ctx, width, height, state, view, ui, evaluation) {
     const wire = state.wires[wireId];
     strokePolyline(ctx, wire.points, view, WIRE_COLOR, 2);
   }
-  drawWireSelection(ctx, state, view, overlay.selection);
-  drawBridges(ctx, state, view, overlay.selection);
-  drawEndpoints(ctx, state, view);
+  drawWireSelection(ctx, state, view, overlay.selection, oscillatingWires);
+  // Redraw the same wire geometry before bridges restore over/under separation.
+  for (const wireId of oscillatingWires) {
+    strokePolyline(ctx, state.wires[wireId].points, view, pulse.color, pulse.width);
+  }
+  drawBridges(ctx, state, view, overlay.selection, oscillatingWires, pulse);
+  drawEndpoints(ctx, state, view, oscillatingWires, pulse);
 
   for (const componentId of Object.keys(state.components)) {
     drawComponent(ctx, state.components[componentId], view, evaluation, { definitions: (ui || {}).definitions });
@@ -1534,6 +1574,7 @@ export function render(ctx, width, height, state, view, ui, evaluation) {
 
   drawGhost(ctx, view, overlay.dragGhost, { definitions: (ui || {}).definitions });
   drawComponentSelection(ctx, state, view, overlay.selection, { definitions: (ui || {}).definitions });
+  drawOscillatingComponents(ctx, state, view, highlight, pulse, overlay.definitions);
   drawWireDrag(ctx, view, overlay.wireDrag || overlay.endpointDrag);
   drawGroupDrag(ctx, view, overlay.groupDrag, { definitions: (ui || {}).definitions });
   drawCopyGhost(ctx, view, overlay.copyGhost, { definitions: (ui || {}).definitions });

@@ -174,7 +174,11 @@ export function createPanel(context) {
         const value = draft.inputs[port.id] ? 1 : 0;
         button.textContent = port.name + ': ' + value;
         button.classList.toggle('on', value === 1);
-        button.addEventListener('click', function () { context.toggleDraftInput(port); });
+        button.disabled = Boolean(draft.inspection);
+        if (draft.inspection) button.title = '振荡现场输入已冻结';
+        button.addEventListener('click', function () {
+          if (!draft.inspection) context.toggleDraftInput(port);
+        });
         group.items.appendChild(button);
       }
       context.encapInputs.appendChild(group.row);
@@ -305,10 +309,15 @@ export function createPanel(context) {
     }
     if (!draft) {
       context.encapWorkbenchCrumb.textContent = '主图纸 / 封装';
+      context.encapWorkbenchCrumb.title = '';
       return;
     }
-    const names = draftChainOf(draft).map(draftDisplayName);
+    const names = draftChainOf(draft).map(function (item) {
+      return draftDisplayName(item) + (item.inspection ? '（' + item.inspection.instanceId + '）' : '');
+    });
     context.encapWorkbenchCrumb.textContent = ['主图纸'].concat(names).join(' / ');
+    context.encapWorkbenchCrumb.title = draft.inspection
+      ? '实例路径：' + draft.inspection.path.join(' / ') : '';
   }
 
   function syncWorkbenchHeading(draft) {
@@ -325,11 +334,11 @@ export function createPanel(context) {
       return;
     }
     const displayName = draftDisplayName(draft);
-    context.encapWorkbenchTitle.textContent = displayName;
+    context.encapWorkbenchTitle.textContent = displayName + (draft.inspection ? ' · 振荡现场' : '');
     context.encapWorkbenchTitle.title = displayName;
     if (context.encapKind) {
-      context.encapKind.hidden = Boolean(draft.readOnly);
-      context.encapKind.textContent = draft.readOnly ? '' : (draft.definitionId ? '编辑中' : '新建');
+      context.encapKind.hidden = Boolean(draft.readOnly) && !draft.inspection;
+      context.encapKind.textContent = draft.inspection ? '冻结现场' : draft.readOnly ? '' : (draft.definitionId ? '编辑中' : '新建');
     }
   }
 
@@ -406,7 +415,7 @@ export function createPanel(context) {
     syncWorkbenchCrumb(draft);
     if (context.encapMainNoteText) {
       context.encapMainNoteText.textContent = readOnly
-        ? '封装详情中 · 暂不可操作'
+        ? draft.inspection ? '振荡现场中 · 原图纸暂不可操作' : '封装详情中 · 暂不可操作'
         : '封装编辑中 · 暂不可操作';
     }
     if (document.activeElement !== context.encapName) context.encapName.value = draft.name;
@@ -430,12 +439,18 @@ export function createPanel(context) {
         context.encapClose.setAttribute('aria-label', readOnly ? '关闭封装详情' : '关闭封装工作台');
       }
     }
-    context.encapEdit.hidden = !readOnly || !draft.definitionId;
-    context.encapEdit.disabled = readOnly && !draft.canEditDefinition;
+    context.encapEdit.hidden = Boolean(draft.inspection) || !readOnly || !draft.definitionId;
+    context.encapEdit.disabled = Boolean(draft.inspection) || (readOnly && !draft.canEditDefinition);
     context.encapEdit.title = readOnly && !draft.canEditDefinition
       ? (draft.editBlockedReason || '当前不能编辑该定义')
       : '进入编辑模式';
-    if (readOnly) {
+    if (draft.inspection) {
+      const sceneHint = draft.inspection.kind === 'outer-feedback'
+        ? '内部当前稳定，振荡反馈在上一层；OUT 为内部已提交状态。'
+        : '显示本次内部振荡尝试；OUT 为现场值，尚未向上一层提交。';
+      context.encapHint.textContent = sceneHint + '现场只读，IN 已冻结，不能编辑或保存；可右键红色封装“详细”继续逐层定位。' +
+        '实例路径：' + draft.inspection.path.join(' / ') + '。';
+    } else if (readOnly) {
       context.encapHint.textContent = draft.canEditDefinition
         ? '只读查看；可在“测试”区临时切换 IN 观察 OUT，不会保存；点击“编辑”可修改定义。'
         : '只读查看；可在“测试”区临时切换 IN 观察 OUT，不会保存；' +

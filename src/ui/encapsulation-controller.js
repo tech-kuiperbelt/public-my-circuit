@@ -5,12 +5,14 @@ import { evaluateDynamic } from '../core/dynamic.js';
 import { createEditHistory } from './edit-history.js';
 
 import { definitionEditEligibility } from './library.js';
+import { resolveInstanceInspection } from './instance-inspection.js';
 
 // context 显式注入所需的应用对象、元素、服务与跨模块回调。
 export function createController(context) {
   let encapCloseDialogSaving = false;
 
   async function openEncapsulationEditor(definitionId, options) {
+    const instanceId = options && options.instanceId;
     const parentDraft = context.app.draft;
     if (parentDraft && (!definitionId || (options && options.edit))) {
       context.toast.show('请先关闭当前封装详情或编辑');
@@ -24,6 +26,10 @@ export function createController(context) {
       context.toast.show('该定义已在当前封装路径中，不能重复打开');
       return;
     }
+    if (instanceId && (!definitionId || (options && options.edit))) {
+      context.toast.show('振荡现场只能只读查看');
+      return;
+    }
     const wantsEdit = !definitionId || Boolean(options && options.edit);
     if (wantsEdit) {
       const flushed = await context.session.flush();
@@ -33,6 +39,25 @@ export function createController(context) {
       }
     }
     const library = context.session.getLibrary();
+    let inspection = null;
+    let resolved = null;
+    if (instanceId) {
+      const instance = context.app.state.components[instanceId];
+      if (!instance || instance.type !== 'CUSTOM' || instance.definitionId !== definitionId) {
+        context.toast.show('封装实例与定义不匹配，无法打开现场');
+        return;
+      }
+      resolved = resolveInstanceInspection(context.app.state, context.app.evaluation, instanceId, library);
+      if (!resolved.ok) {
+        context.toast.show(resolved.reason);
+        return;
+      }
+      inspection = {
+        instanceId,
+        path: (parentDraft && parentDraft.inspection ? parentDraft.inspection.path : []).concat(instanceId),
+        kind: resolved.kind
+      };
+    }
     let state;
     let evaluation;
     let ports = [];
@@ -70,7 +95,7 @@ export function createController(context) {
       }
       editingId = definitionId;
       state = cloneValue(definition.circuit);
-      evaluation = cloneValue(definition.initialEvaluation);
+      evaluation = cloneValue(inspection ? resolved.evaluation : definition.initialEvaluation);
       ports = cloneValue(definition.ports || []);
       rows = definition.size && definition.size.rows ? definition.size.rows : 1;
       cols = definition.size && definition.size.cols ? definition.size.cols : 1;
@@ -78,6 +103,11 @@ export function createController(context) {
       icon = definition.icon || null;
       for (const port of ports) {
         if (port.direction === 'in') inputs[port.id] = 0;
+      }
+      if (inspection) {
+        inputs = cloneValue(resolved.inputs);
+        canEditDefinition = false;
+        editBlockedReason = '振荡现场已冻结，不能编辑定义或切换输入';
       }
     } else {
       state = createState();
@@ -105,6 +135,7 @@ export function createController(context) {
       readOnly,
       canEditDefinition,
       editBlockedReason,
+      inspection,
       nextPortNumber: 1,
       previewZoom: 1,
       parent: parentDraft || null,
@@ -155,6 +186,10 @@ export function createController(context) {
 
   async function switchEncapsulationToEdit() {
     const draft = context.app.draft;
+    if (draft && draft.inspection) {
+      context.toast.show('振荡现场已冻结，不能进入编辑模式');
+      return;
+    }
     if (!draft || !draft.readOnly || !draft.definitionId || !context.session) {
       return;
     }
@@ -367,6 +402,10 @@ export function createController(context) {
   async function saveEncapsulationEditor() {
     const draft = context.app.draft;
     if (!draft) return;
+    if (draft.inspection) {
+      context.toast.show('振荡现场已冻结，不能保存');
+      return;
+    }
     if (draft.readOnly) {
       context.toast.show('只读详情不能保存；请先点击“编辑”');
       return;

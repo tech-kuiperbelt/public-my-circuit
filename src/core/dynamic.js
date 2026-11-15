@@ -45,6 +45,14 @@ function compactFailure(result) {
   if (!result) {
     return null;
   }
+  // A runtime failure is a frozen diagnostic boundary, distinct from the
+  // instance's last committed `internal` state. Keep its full attempted
+  // evaluation so the UI can inspect each real layer without replaying it.
+  // The evaluation already contains exactly one nested failure chain and no
+  // circuit copy; do not wrap it in a second evaluation/failure tree.
+  if (result.ok === true && (result.status === 'oscillating' || result.status === 'budget')) {
+    return { ...result };
+  }
   const compact = {
     status: result.status,
     reason: result.reason,
@@ -98,6 +106,75 @@ function initialInnerEvaluation(definition) {
     return null;
   }
   return clone(definition.initialEvaluation);
+}
+
+// Diagnostic-only graph: a feedback connection is active only when its actual
+// driver pin changed during the repeated period. Iterative Kosaraju avoids a
+// call-stack limit on large circuits. Neither this graph nor its result is read
+// by the simulator, state signature, or budget accounting.
+function oscillatingFeedback(built, lastChangedRound, startRound) {
+  const adjacency = new Map(), reverse = new Map();
+  const activeNets = [];
+  function node(id) {
+    if (!adjacency.has(id)) {
+      adjacency.set(id, new Set());
+      reverse.set(id, new Set());
+    }
+  }
+  for (const net of built.nets) {
+    const driver = net.driverPins[0];
+    if (!driver || !(lastChangedRound.get(driver.componentId + ':' + driver.pinId) > startRound)) continue;
+    const from = driver.componentId;
+    node(from);
+    const targets = net.pins.filter(pin => pin.dir === 'in').map(pin => pin.componentId);
+    for (const to of targets) {
+      node(to);
+      adjacency.get(from).add(to);
+      reverse.get(to).add(from);
+    }
+    activeNets.push({ id: net.id, from, targets });
+  }
+  const seen = new Set(), order = [];
+  for (const root of adjacency.keys()) {
+    if (seen.has(root)) continue;
+    seen.add(root);
+    const stack = [{ id: root, next: adjacency.get(root).values() }];
+    while (stack.length) {
+      const top = stack[stack.length - 1];
+      const next = top.next.next();
+      if (next.done) {
+        order.push(top.id);
+        stack.pop();
+      } else if (!seen.has(next.value)) {
+        seen.add(next.value);
+        stack.push({ id: next.value, next: adjacency.get(next.value).values() });
+      }
+    }
+  }
+  const groups = new Map(), cyclic = new Set(), componentIds = [];
+  for (let i = order.length - 1; i >= 0; i -= 1) {
+    const root = order[i];
+    if (groups.has(root)) continue;
+    const members = [], stack = [root];
+    groups.set(root, root);
+    while (stack.length) {
+      const id = stack.pop();
+      members.push(id);
+      for (const predecessor of reverse.get(id)) {
+        if (!groups.has(predecessor)) {
+          groups.set(predecessor, root);
+          stack.push(predecessor);
+        }
+      }
+    }
+    if (members.length > 1 || adjacency.get(root).has(root)) {
+      cyclic.add(root);
+      for (const id of members) componentIds.push(id);
+    }
+  }
+  const netIds = activeNets.filter(net => cyclic.has(groups.get(net.from)) &&
+    net.targets.some(to => groups.get(to) === groups.get(net.from))).map(net => net.id);
+  return { componentIds: componentIds.sort(), netIds: netIds.sort() };
 }
 
 export function evaluateDynamic(state, previous, limits, options) {
@@ -321,6 +398,8 @@ export function evaluateDynamic(state, previous, limits, options) {
     }
   }
   const hasFeedback = ready.length !== gates.length;
+  // One entry per changing output, rather than a per-round trace/history.
+  const lastChangedRound = hasFeedback ? new Map() : null;
   stats.hasFeedback = hasFeedback;
   const seen = new Map();
   let status = 'stable', cycle = null, failure = null;
@@ -473,9 +552,15 @@ export function evaluateDynamic(state, previous, limits, options) {
         pinValue[id + ':' + portId] = entry.outputs[portId];
       }
     }
-    for (const [id, value] of nextMeta) publish(id + ':out', value);
+    for (const [id, value] of nextMeta) {
+      if (lastChangedRound) lastChangedRound.set(id + ':out', stats.rounds);
+      publish(id + ':out', value);
+    }
     for (const [id, entry] of nextCustom) {
-      for (const portId of entry.changedPins) publish(id + ':' + portId, entry.outputs[portId]);
+      for (const portId of entry.changedPins) {
+        if (lastChangedRound) lastChangedRound.set(id + ':' + portId, stats.rounds);
+        publish(id + ':' + portId, entry.outputs[portId]);
+      }
     }
     snapshot(stats.rounds, frontier, changed);
   }
@@ -505,6 +590,11 @@ export function evaluateDynamic(state, previous, limits, options) {
   if (hasCustom) result.internal = internal;
   if (failure) result.failure = failure;
   if (cycle) result.cycle = cycle;
+  if (status === 'oscillating') {
+    result.oscillation = cycle
+      ? oscillatingFeedback(built, lastChangedRound, cycle.startRound)
+      : { componentIds: failure && failure.path.length ? [failure.path[0]] : [], netIds: [] };
+  }
   if (tracing) result.trace = trace;
   return result;
 }

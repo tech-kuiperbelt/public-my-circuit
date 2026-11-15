@@ -18,6 +18,7 @@ import {
   unionSelection
 } from './selection.js';
 import { REASONS } from '../core/reasons.js';
+import { getOscillationHighlight } from './oscillation-highlight.js';
 import { FRAME_DEFAULT_COLOR, FRAME_DEFAULT_LABEL } from '../core/entities.js';
 import {
   autoRouteWires,
@@ -2257,10 +2258,12 @@ export function attachInput(options) {
     const items = [];
     const customDefinitionId = selectionCustomDefinitionId(state, selection);
     if (customDefinitionId) {
+      const highlight = getOscillationHighlight(state, app.evaluation, app.getDefinitions());
+      const instanceId = highlight && highlight.componentIds.includes(selection.id) ? selection.id : null;
       items.push({
         label: '详细',
         onSelect: function () {
-          void app.openEncapsulationEditor(customDefinitionId);
+          void app.openEncapsulationEditor(customDefinitionId, instanceId ? { instanceId } : undefined);
         }
       });
     }

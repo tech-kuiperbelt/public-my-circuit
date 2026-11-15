@@ -14,7 +14,7 @@ import {
   portValue
 } from './ports.js';
 
-const GATES = new Set(['NOT', 'AND', 'OR', 'DELAY']);
+const GATES = new Set(['NOT', 'AND', 'OR', 'DELAY', 'CUSTOM']);
 const OUTPUT_TYPES = new Set(['CONST1', 'TOGGLE', 'BUTTON', 'CLOCK', 'NOT', 'AND', 'OR', 'DELAY']);
 const STATUSES = new Set(['stable', 'oscillating', 'budget']);
 const GENERATED_ID = /^[cwf](\d+)$/;
@@ -291,6 +291,64 @@ function validateCycle(cycle) {
   return { ok: true };
 }
 
+// A nested runtime failure has no local cycle: its full attempted child
+// evaluation supplies the next boundary, ending at a real cycle (or budget).
+// This is read-only validation, never a replay of the simulator.
+function validateRuntimeFailure(evaluation, state, options) {
+  const failure = evaluation.failure;
+  if (failure === undefined) return { ok: true };
+  if (!isObject(failure) || failure.kind !== 'runtime' ||
+      evaluation.status === 'stable' || failure.status !== evaluation.status ||
+      !Array.isArray(failure.path) || failure.path.length === 0 ||
+      !failure.path.every(isId)) {
+    return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'failure');
+  }
+  const id = failure.path[0];
+  const component = state.components[id];
+  if (!component || component.type !== 'CUSTOM' || !evaluation.pending.includes(id)) {
+    return fail(SNAPSHOT_REASONS.INCONSISTENT, 'failure.path');
+  }
+  if (evaluation.cycle !== undefined && evaluation.cycle !== null) {
+    return fail(SNAPSHOT_REASONS.INCONSISTENT, 'failure.cycle');
+  }
+  const inner = failure.inner;
+  if (!isObject(inner) || inner.status !== failure.status) {
+    return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'failure.inner.status');
+  }
+  // Earlier compact summaries omitted the leaf cycle and actual pin values.
+  // They were never restorable as nested oscillation snapshots; reject them
+  // explicitly rather than inventing a cycle or evaluating during validation.
+  if (!isObject(inner.pinValue)) {
+    return fail(SNAPSHOT_REASONS.INVALID_EVALUATION,
+      failure.status === 'oscillating' ? 'failure.inner.legacy-missing-cycle' : 'failure.inner.legacy-incomplete');
+  }
+  const rest = failure.path.slice(1);
+  if (rest.length) {
+    if (!isObject(inner.failure) || inner.failure.kind !== 'runtime' ||
+        !Array.isArray(inner.failure.path) || inner.failure.path.length !== rest.length ||
+        !rest.every((part, index) => inner.failure.path[index] === part)) {
+      return fail(SNAPSHOT_REASONS.INCONSISTENT, 'failure.path');
+    }
+  } else if (inner.failure !== undefined) {
+    return fail(SNAPSHOT_REASONS.INCONSISTENT, 'failure.path');
+  }
+  const definitions = options && options.definitions;
+  const definition = getDefinition(definitions, component.definitionId);
+  const innerState = validateState(definition.circuit, { definitions, includeBarePins: true });
+  if (!innerState.ok) {
+    return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'failure.inner.state');
+  }
+  const checked = validateEvaluation(inner, definition.circuit, innerState.built, {
+    definitions,
+    includeBarePins: true,
+    externalInputs: externalInputsForInstance(evaluation, id, definition)
+  });
+  if (!checked.ok) {
+    return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'failure.inner.' + checked.detail);
+  }
+  return { ok: true };
+}
+
 function validateEvaluation(evaluation, state, built, options) {
   const definitions = options && options.definitions;
   const externalInputs = (options && options.externalInputs) || [];
@@ -451,6 +509,20 @@ function validateEvaluation(evaluation, state, built, options) {
     }
   }
 
+  if (!Array.isArray(evaluation.pending)) {
+    return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'pending');
+  }
+  const pendingSeen = new Set();
+  for (const id of evaluation.pending) {
+    if (!isId(id) || !hasOwn(state.components, id) || !GATES.has(state.components[id].type)) {
+      return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'pending.' + id);
+    }
+    if (pendingSeen.has(id)) {
+      return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'pending.duplicate');
+    }
+    pendingSeen.add(id);
+  }
+
   if (customIds.length === 0) {
     if (evaluation.internal !== undefined) {
       if (!isObject(evaluation.internal) || Object.keys(evaluation.internal).length !== 0) {
@@ -479,7 +551,16 @@ function validateEvaluation(evaluation, state, built, options) {
       if (!innerState.ok) {
         return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'internal.' + id + '.state');
       }
-      const innerExternal = externalInputsForInstance(evaluation, id, definition);
+      // A pending instance has not yet committed its new parent inputs.
+      // Validate its stored stable state against its own committed IN values;
+      // a nonpending instance must still match the current parent boundary.
+      const innerExternal = pendingSeen.has(id)
+        ? inputPorts(definition).map(port => ({
+          portId: port.id,
+          binding: port.binding,
+          value: portValue(entry.evaluation, definition, port, innerState.built)
+        }))
+        : externalInputsForInstance(evaluation, id, definition);
       const innerResult = validateEvaluation(entry.evaluation, definition.circuit, innerState.built, {
         definitions,
         includeBarePins: true,
@@ -500,26 +581,15 @@ function validateEvaluation(evaluation, state, built, options) {
       }
       for (const port of inputPorts(definition)) {
         const expected = portValue(entry.evaluation, definition, port, innerBuilt);
-        if (evaluation.pinValue[id + ':' + port.id] !== expected) {
+        if (!pendingSeen.has(id) && evaluation.pinValue[id + ':' + port.id] !== expected) {
           return fail(SNAPSHOT_REASONS.INCONSISTENT, 'internal.' + id + '.input.' + port.id);
         }
       }
     }
   }
 
-  if (!Array.isArray(evaluation.pending)) {
-    return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'pending');
-  }
-  const pendingSeen = new Set();
-  for (const id of evaluation.pending) {
-    if (!isId(id) || !hasOwn(state.components, id) || !GATES.has(state.components[id].type)) {
-      return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'pending.' + id);
-    }
-    if (pendingSeen.has(id)) {
-      return fail(SNAPSHOT_REASONS.INVALID_EVALUATION, 'pending.duplicate');
-    }
-    pendingSeen.add(id);
-  }
+  const failureResult = validateRuntimeFailure(evaluation, state, options);
+  if (!failureResult.ok) return failureResult;
 
   if (evaluation.status === 'stable') {
     if (evaluation.pending.length !== 0) {
@@ -532,9 +602,11 @@ function validateEvaluation(evaluation, state, built, options) {
     if (evaluation.pending.length === 0) {
       return fail(SNAPSHOT_REASONS.INCONSISTENT, 'pending.oscillating');
     }
-    const cycle = validateCycle(evaluation.cycle);
-    if (!cycle.ok) {
-      return cycle;
+    if (evaluation.failure === undefined) {
+      const cycle = validateCycle(evaluation.cycle);
+      if (!cycle.ok) {
+        return cycle;
+      }
     }
   } else {
     if (evaluation.pending.length === 0) {

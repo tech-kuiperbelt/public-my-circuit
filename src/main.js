@@ -19,6 +19,7 @@ import { CELL, componentBounds, componentDefinition, componentPins, pinWorld, po
 
 import { placeComponent, resetClocksCommand, setClockPeriodCommand } from './core/commands.js';
 import { clampScale, hitPortAnnotation, hitPortAnnotationLabel, previewPortLabelRects, previewPortSlots, render, screenToWorld, worldToScreen } from './ui/view.js';
+import { getOscillationHighlight, hasVisibleOscillationHighlight } from './ui/oscillation-highlight.js';
 import { COMPONENT_SLOTS, createComponentBar, createToolBar, nextMode } from './ui/toolbar.js';
 import { resolveComponentDropTarget } from './ui/component-drop-target.js';
 import { createComponentBoxController } from './ui/component-box-controller.js';
@@ -39,6 +40,8 @@ import { createIconPicker } from './ui/icon-picker.js';
 
 const canvas = document.getElementById('board');
 const ctx = canvas.getContext('2d');
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+let lastOscillationPaint = -Infinity;
 const componentsElement = document.getElementById('components');
 const componentBoxElement = document.getElementById('component-box');
 const componentBoxToggleElement = document.getElementById('component-box-toggle');
@@ -192,8 +195,8 @@ const app = {
   editClockPeriod(componentId) {
     return editClockPeriod(componentId);
   },
-  openEncapsulationEditor(definitionId) {
-    return openEncapsulationEditor(definitionId);
+  openEncapsulationEditor(definitionId, options) {
+    return openEncapsulationEditor(definitionId, options);
   },
   closeEncapsulationEditor() {
     closeEncapsulationEditor();
@@ -781,8 +784,14 @@ function updateRuntimeStatus() {
   runtimeStatus.dataset.status = status || 'stable';
   runtimeStatus.hidden = status !== 'oscillating' && status !== 'budget';
   runtimeStatus.textContent = status === 'oscillating'
-    ? '检测到周期振荡（周期 ' + app.evaluation.cycle.period + ' 轮）。已暂停传播，可修改电路恢复。'
+    ? (app.evaluation.cycle
+      ? '检测到周期振荡（周期 ' + app.evaluation.cycle.period + ' 轮）。'
+      : '自定义元件内部检测到周期振荡。') + '已暂停传播，可修改电路恢复。'
     : status === 'budget' ? '传播超出计算预算，暂未判定稳定性。已保留当前状态，可修改电路。' : '';
+  if (status === 'oscillating' && Array.isArray(app.evaluation.oscillation?.componentIds) &&
+      app.evaluation.oscillation.componentIds.some(id => app.state.components[id]?.type === 'CUSTOM')) {
+    runtimeStatus.textContent += '右键红色封装，选择“详细”可逐层定位。';
+  }
 }
 
 function draftPortAnchor(draft, binding) {
@@ -832,7 +841,7 @@ function draftPortAnnotations(draft) {
   return annotations;
 }
 
-function renderFrame() {
+function renderFrame(timestamp = performance.now()) {
   render(
     ctx,
     canvas.width,
@@ -841,6 +850,8 @@ function renderFrame() {
     app.view,
     {
       definitions: app.getDefinitions(),
+      oscillationTimeMs: timestamp,
+      reducedMotion: reducedMotion.matches,
       selection: app.selection,
       preview: app.overlay.preview,
       hoverAnchor: app.overlay.hoverAnchor,
@@ -1109,7 +1120,7 @@ async function editClockPeriod(componentId) {
 function toggleDraftInput(port) {
   const draft = app.draft;
   // 测试只改变临时运行态，不写定义/Session；只读详情也允许测试。
-  if (!draft || port.direction !== 'in') return;
+  if (!draft || draft.inspection || port.direction !== 'in') return;
   const change = () => {
     const next = Object.assign({}, draft.inputs, { [port.id]: draft.inputs[port.id] ? 0 : 1 });
     const result = evaluateDraft(Object.assign({}, draft, { inputs: next }), draft.evaluation);
@@ -1749,6 +1760,16 @@ function resetClockSimulation() {
 function simulationFrame(timestamp) {
   window.requestAnimationFrame(simulationFrame);
   syncHistoryTools();
+  // 脉动只重绘画布，不求值、不创建编辑历史，也不触发Session保存。
+  // 独立于时钟暂停和封装工作台；静态/屏外高亮不持续重绘。
+  if (!reducedMotion.matches && !document.hidden && timestamp - lastOscillationPaint >= 1000 / 30) {
+    const definitions = app.getDefinitions();
+    const highlight = getOscillationHighlight(app.state, app.evaluation, definitions);
+    if (hasVisibleOscillationHighlight(app.state, app.view, canvas.width, canvas.height, highlight, definitions)) {
+      lastOscillationPaint = timestamp;
+      renderFrame(timestamp);
+    }
+  }
   if (lastFrameTime === null) {
     lastFrameTime = timestamp;
     return;
@@ -2162,6 +2183,7 @@ window.addEventListener('pageshow', function (event) {
     session.resume();
   }
 });
+reducedMotion.addEventListener('change', function () { renderFrame(); });
 window.addEventListener('resize', resize);
 resize();
 
