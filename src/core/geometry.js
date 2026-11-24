@@ -235,7 +235,10 @@ export function pinWorld(instance, pinId, definitions) {
 // 线段是否与元件格边界共线并发生正长度重叠。
 // 仅端点/拐点接触边角不算“贴着”；引脚法向出入也不会触发。
 export function segmentOverlapsComponentEdge(a, b, component, definitionOptions = {}) {
-  const bounds = componentBounds(component, definitionOptions.definitions);
+  return segmentOverlapsBoundsEdge(a, b, componentBounds(component, definitionOptions.definitions));
+}
+
+export function segmentOverlapsBoundsEdge(a, b, bounds) {
   const x0 = bounds.x;
   const x1 = bounds.x + bounds.w;
   const y0 = bounds.y;

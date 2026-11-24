@@ -508,6 +508,9 @@ const app = {
     if (this.isReadOnlyDraft() && mode !== 'select') {
       mode = 'select';
     }
+    const leavingCopy = this.mode === 'copy' && mode !== 'copy';
+    const redrawCopy = leavingCopy && Boolean(this.overlay.copyGhost);
+    if (leavingCopy) input?.cancelWire();
     this.mode = mode;
     if (mode === 'select' || mode === 'annotate' || mode === 'erase-port') {
       this.placeType = null;
@@ -530,6 +533,7 @@ const app = {
     if (this.draft) {
       syncDraftPortButtons();
     }
+    if (redrawCopy) this.render();
   },
   isReadOnlyDraft() {
     return Boolean(this.draft && this.draft.readOnly);

@@ -103,8 +103,8 @@ function createMinHeap() {
 }
 
 // 每条导线的展开点元数据：局部方向、是否顶点、是否端点。
-// 同时预计算“交叉闸口”：可垂直穿越的点及其上下/左右各一个布线网格，只允许沿穿越方向通行。
-function buildWireMeta(state) {
+// 寻路还需要“交叉闸口”：可垂直穿越的点及其上下/左右各一个布线网格，只允许沿穿越方向通行。
+function buildWireMeta(state, { includeGates = true } = {}) {
   const meta = new Map();
   const gateDirs = new Map();
 
@@ -145,12 +145,14 @@ function buildWireMeta(state) {
           isVertex: vertices.has(key),
           isEndpoint: endKeys.has(key)
         };
-        if (!meta.has(key)) {
-          meta.set(key, []);
+        const entries = meta.get(key);
+        if (entries) {
+          entries.push(entry);
+        } else {
+          meta.set(key, [entry]);
         }
-        meta.get(key).push(entry);
 
-        if (entry.isVertex || entry.isEndpoint) {
+        if (!includeGates || entry.isVertex || entry.isEndpoint) {
           continue;
         }
         const perpendicular = dir.x !== 0

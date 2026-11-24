@@ -217,6 +217,23 @@ export function attachInput(options) {
     }
   }
 
+  function cancelInputGestures(options) {
+    releaseActiveButton({ discard: Boolean(options && options.discardButton) });
+    cancelRubberFrame();
+    armed = null;
+    lastScreen = null;
+    componentDrag = null;
+    wireDrag = null;
+    endpointDrag = null;
+    freeDraw = null;
+    panDrag = null;
+    if (portDrag) {
+      portDrag = null;
+      app.setPortDrag(null);
+    }
+    clearOverlays();
+  }
+
   // 松开 BUTTON：删除/替换状态后也安全；已为 0 时不重复提交。
   function releaseActiveButton(options) {
     const restored = restoredButtons;
@@ -700,8 +717,7 @@ export function attachInput(options) {
   }
 
   function resetCopySession() {
-    copySession = { phase: 'idle' };
-    app.overlay.copyGhost = null;
+    beginCopySession('idle');
   }
 
   function cancelPendingCopy() {
@@ -709,14 +725,18 @@ export function attachInput(options) {
   }
 
   function beginCopySession(phase, details = {}) {
+    if (copySession.previewFrame !== undefined) {
+      window.cancelAnimationFrame(copySession.previewFrame);
+    }
     copySession = { phase, ...details };
     app.overlay.copyGhost = null;
   }
 
-  function activateCopyTool() {
+  function activateCopyTool(phase, details) {
+    beginCopySession(phase, details);
+    menu.close();
     app.tool = 'COPY';
     app.setMode('copy');
-    hoverKey = '';
     app.render();
   }
 
@@ -724,21 +744,21 @@ export function attachInput(options) {
     if (app.isReadOnlyDraft() || !snapshotHasObjects(snapshot)) {
       return false;
     }
-    beginCopySession('placing', { snapshot, signature: null });
-    app.overlay.hoverAnchor = null;
-    activateCopyTool();
+    cancelInputGestures();
+    activateCopyTool('placing', { snapshot });
     return true;
   }
 
-  function startCopy(selection) {
-    const snapshot = captureCopySnapshot(selection);
-    if (snapshot) {
-      startCopyWithSnapshot(snapshot);
+  function startCopy(selection, dragPointerId) {
+    if (app.isReadOnlyDraft()) return;
+    cancelInputGestures();
+    const snapshot = buildCopySnapshot(selection);
+    if (snapshotHasObjects(snapshot)) {
+      activateCopyTool('placing', { snapshot, dragPointerId });
     }
   }
 
-  // Ctrl/Cmd+拖动多选：按下时先挂起，移动超过阈值后复用右键「复制」的状态；
-  // 不移动就松开仍按原来的切换选择处理。
+  // Ctrl/Cmd+拖动：达到阈值后复用复制预览，由发起拖动的指针在松手时放置。
   function canStartCtrlCopy(state, selection, target) {
     return !app.isReadOnlyDraft() &&
       selection &&
@@ -768,27 +788,61 @@ export function attachInput(options) {
     }
   }
 
+  function ctrlCopyPointerId() {
+    return copySession.phase === 'pending' ? copySession.pointerId : copySession.dragPointerId;
+  }
+
+  function startCopyDragIfMoved(screen) {
+    const drag = copySession;
+    if (Math.hypot(screen.x - drag.start.x, screen.y - drag.start.y) < 4) return false;
+    resetCopySession();
+    startCopy(drag.selection, drag.pointerId);
+    return true;
+  }
+
+  function finishCtrlCopyDrag(screen) {
+    if (copySession.phase === 'pending') {
+      const { target } = copySession;
+      if (!startCopyDragIfMoved(screen)) {
+        resetCopySession();
+        app.setSelection(toggleSelectionObject(app.getSelection(), target));
+        app.render();
+        return;
+      }
+    }
+    if (app.getMode() !== 'copy' || app.isReadOnlyDraft()) {
+      cancelCopy();
+      return;
+    }
+    copySession.dragPointerId = undefined;
+    placeCopyAt(screen);
+    // 非法落点保留普通复制状态，预览以松手位置为准，可单击重试。
+    if (copySession.phase === 'placing') requestCopyPreview(screen);
+  }
+
+  function cancelCtrlCopyDrag(pointerId) {
+    const activePointerId = ctrlCopyPointerId();
+    if (activePointerId === undefined || (pointerId !== undefined && pointerId !== activePointerId)) return;
+    if (copySession.phase === 'pending') resetCopySession();
+    else cancelCopy();
+  }
+
   function copyAnchor(screen) {
     const world = screenToWorld(screen, app.getView());
     return copyAnchorAt(copySession.snapshot, world);
   }
 
   function updateCopyAt(screen) {
-    if (copySession.phase !== 'placing') {
+    const { cx, cy } = copyAnchor(screen);
+    const state = app.getState();
+    const definitions = app.getDefinitions();
+    const previous = copySession.previewed;
+    if (previous && previous.cx === cx && previous.cy === cy &&
+        previous.state === state && previous.definitions === definitions) {
       return;
     }
-    const anchor = copyAnchor(screen);
-    const signature = anchor.cx + ',' + anchor.cy;
-    if (signature === copySession.signature) {
-      return;
-    }
-    copySession.signature = signature;
-    const preview = previewCopySelection(
-      app.getState(),
-      copySession.snapshot,
-      anchor.cx,
-      anchor.cy
-    , { definitions: app.getDefinitions() });
+    const preview = previewCopySelection(state, copySession.snapshot, cx, cy, { definitions });
+    copySession.previewed = { cx, cy, state, definitions };
     app.overlay.copyGhost = {
       components: (preview.components || []).map(function (target) {
         return {
@@ -804,6 +858,26 @@ export function attachInput(options) {
       status: preview.ok ? 'valid' : 'invalid'
     };
     app.render();
+  }
+
+  function requestCopyPreview(screen) {
+    const session = copySession;
+    session.previewScreen = screen;
+    if (session.previewFrame !== undefined) {
+      return;
+    }
+    session.previewFrame = window.requestAnimationFrame(function () {
+      session.previewFrame = undefined;
+      if (session !== copySession) {
+        return;
+      }
+      if (app.getMode() !== 'copy') {
+        resetCopySession();
+        app.render();
+        return;
+      }
+      updateCopyAt(session.previewScreen);
+    });
   }
 
   function cancelCopy() {
@@ -827,10 +901,8 @@ export function attachInput(options) {
       startCopy(selection);
       return;
     }
-    disarm();
-    clearOverlays();
-    beginCopySession('picking');
-    activateCopyTool();
+    cancelInputGestures();
+    activateCopyTool('picking');
   }
 
   function handleCopyPick(screen, event) {
@@ -1460,6 +1532,7 @@ export function attachInput(options) {
   }
 
   function handlePointerDown(event) {
+    if (ctrlCopyPointerId() !== undefined) return;
     setComponentHover(null, eventScreenPoint(event, canvas));
     if (event.button === 1 || (event.button === 0 && spaceHeld)) {
       event.preventDefault();
@@ -1509,13 +1582,12 @@ export function attachInput(options) {
       return;
     }
 
-    if (copySession.phase === 'placing') {
-      placeCopyAt(screen);
-      return;
-    }
-
     if (app.getMode() === 'copy') {
-      handleCopyPick(screen, event);
+      if (copySession.phase === 'placing') {
+        placeCopyAt(screen);
+      } else {
+        handleCopyPick(screen, event);
+      }
       return;
     }
 
@@ -1851,17 +1923,12 @@ export function attachInput(options) {
   }
 
   function handlePointerMove(event) {
+    const copyPointerId = ctrlCopyPointerId();
+    if (copyPointerId !== undefined && event.pointerId !== copyPointerId) return;
     const screen = eventScreenPoint(event, canvas);
     if (copySession.phase === 'pending') {
-      const dx = screen.x - copySession.start.x;
-      const dy = screen.y - copySession.start.y;
-      if (Math.hypot(dx, dy) >= 4) {
-        const drag = copySession;
-        cancelPendingCopy();
-        startCopy(drag.selection);
-        if (copySession.phase === 'placing') {
-          updateCopyAt(screen);
-        }
+      if (startCopyDragIfMoved(screen) && copySession.phase === 'placing') {
+        requestCopyPreview(screen);
       }
       return;
     }
@@ -1916,7 +1983,7 @@ export function attachInput(options) {
     }
 
     if (copySession.phase === 'placing') {
-      updateCopyAt(screen);
+      requestCopyPreview(screen);
       return;
     }
 
@@ -1988,15 +2055,11 @@ export function attachInput(options) {
       releaseCapture(event);
       return;
     }
-    if (copySession.phase === 'pending') {
-      const drag = copySession;
-      if (drag.pointerId !== null && event.pointerId !== drag.pointerId) {
-        return;
-      }
-      cancelPendingCopy();
-      app.setSelection(toggleSelectionObject(app.getSelection(), drag.target));
+    const copyPointerId = ctrlCopyPointerId();
+    if (copyPointerId !== undefined) {
+      if (event.pointerId !== copyPointerId) return;
+      finishCtrlCopyDrag(eventScreenPoint(event, canvas));
       releaseCapture(event);
-      app.render();
       return;
     }
     if (portDrag) {
@@ -2064,7 +2127,7 @@ export function attachInput(options) {
 
   function handlePointerCancel(event) {
     releaseActiveButton();
-    cancelPendingCopy();
+    cancelCtrlCopyDrag(event.pointerId);
     if (portDrag) {
       portDrag = null;
       app.setPortDrag(null);
@@ -2365,23 +2428,20 @@ export function attachInput(options) {
       return;
     }
 
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey &&
+        event.key?.toLowerCase() === 'c') {
+      if (event.defaultPrevented || app.isReadOnlyDraft() || window.getSelection()?.toString()) {
+        return;
+      }
+      event.preventDefault();
+      if (!event.repeat && app.getMode() !== 'copy') {
+        toggleCopyTool();
+      }
+      return;
+    }
+
     if (event.key === 'Escape') {
-      releaseActiveButton();
-      cancelRubberFrame();
-      armed = null;
-      lastScreen = null;
-      componentDrag = null;
-      wireDrag = null;
-      endpointDrag = null;
-      freeDraw = null;
-      marquee = null;
-      groupDrag = null;
-      frameDraw = null;
-      frameDrag = null;
-      app.overlay.frameDraw = null;
-      app.overlay.frameDrag = null;
-      panDrag = null;
-      clearOverlays();
+      cancelInputGestures();
       app.setMode('select');
       app.render();
       return;
@@ -2404,7 +2464,7 @@ export function attachInput(options) {
   function handleBlur() {
     releaseActiveButton();
     spaceHeld = false;
-    cancelPendingCopy();
+    cancelCtrlCopyDrag();
   }
 
   function handlePointerLeave() {
@@ -2424,6 +2484,9 @@ export function attachInput(options) {
   canvas.addEventListener('pointermove', handlePointerMove);
   canvas.addEventListener('pointerup', handlePointerUp);
   canvas.addEventListener('pointercancel', handlePointerCancel);
+  canvas.addEventListener('lostpointercapture', function (event) {
+    cancelCtrlCopyDrag(event.pointerId);
+  });
   canvas.addEventListener('pointerleave', handlePointerLeave);
   canvas.addEventListener('wheel', handleWheel, { passive: false });
   canvas.addEventListener('dblclick', handleDoubleClick);
@@ -2450,20 +2513,7 @@ export function attachInput(options) {
   });
 
   return {
-    cancel: function (options) {
-      releaseActiveButton({ discard: Boolean(options && options.discardButton) });
-      cancelRubberFrame();
-      armed = null;
-      lastScreen = null;
-      componentDrag = null;
-      wireDrag = null;
-      endpointDrag = null;
-      freeDraw = null;
-      marquee = null;
-      groupDrag = null;
-      panDrag = null;
-      clearOverlays();
-    },
+    cancel: cancelInputGestures,
     trackRestoredButtons: function () {
       restoredButtons = new Set(Object.values(app.getState().components || {})
         .filter(component => component.type === 'BUTTON' && component.on)
