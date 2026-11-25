@@ -25,10 +25,8 @@ import { getOscillationHighlight, oscillationPulse } from './oscillation-highlig
 export const MIN_SCALE = 0.5;
 export const MAX_SCALE = 6;
 
-const BRIDGE_SPAN = 6;
-const BRIDGE_MERGE_DISTANCE = BRIDGE_SPAN * 2;
-const BRIDGE_LIFT = 5;
-const BRIDGE_JOIN = 2;
+const BRIDGE_SPAN = WIRE_GRID / 2;
+const BRIDGE_LIFT = WIRE_GRID * 0.4;
 
 const PIN_LABEL_FONT = '10px sans-serif';
 const PIN_LABEL_GAP = 6;
@@ -36,6 +34,13 @@ const PIN_LABEL_HEIGHT = 12;
 const PIN_LABEL_PAD = 2;
 const PIN_RADIUS = 4;
 const PIN_STROKE_WIDTH = 2;
+const PIN_HIGH_COLOR = '#ffd166';
+const PIN_VALUE_INWARD = {
+  top: { x: 0, y: 1 },
+  right: { x: -1, y: 0 },
+  bottom: { x: 0, y: -1 },
+  left: { x: 1, y: 0 }
+};
 // 最密集的管脚相隔一个布线网格；包含描边的标记直径达到间距时才显示。
 const PIN_MIN_SCALE = (PIN_RADIUS * 2 + PIN_STROKE_WIDTH) / WIRE_GRID;
 // 顺时针旋转后各边的顺序：上 -> 右 -> 下 -> 左。
@@ -128,7 +133,7 @@ function gridLines(ctx, view, width, height) {
   ctx.stroke();
 }
 
-function strokePolyline(ctx, points, view, color, width, dash) {
+function strokePolyline(ctx, points, view, color, width, dash, bridges) {
   if (!points || points.length === 0) {
     return;
   }
@@ -136,6 +141,10 @@ function strokePolyline(ctx, points, view, color, width, dash) {
   const first = worldToScreen(points[0], view);
   ctx.moveTo(first.x, first.y);
   for (let i = 1; i < points.length; i += 1) {
+    const groups = bridges?.get(i - 1);
+    if (groups) {
+      for (const bridge of groups) traceBridge(ctx, view, bridge);
+    }
     const point = worldToScreen(points[i], view);
     ctx.lineTo(point.x, point.y);
   }
@@ -168,201 +177,81 @@ function solidDot(ctx, world, view, color, radius) {
 }
 
 
-function localDirection(points, p) {
-  for (let i = 0; i < points.length - 1; i += 1) {
-    const a = points[i];
-    const b = points[i + 1];
-    if (a.y === b.y && a.y === p.y && Math.min(a.x, b.x) < p.x && p.x < Math.max(a.x, b.x)) {
-      return { x: Math.sign(b.x - a.x), y: 0 };
-    }
-    if (a.x === b.x && a.x === p.x && Math.min(a.y, b.y) < p.y && p.y < Math.max(a.y, b.y)) {
-      return { x: 0, y: Math.sign(b.y - a.y) };
-    }
-  }
-  return null;
+function crossedSegment(points, point) {
+  return points.findIndex(function (a, index) {
+    const b = points[index + 1];
+    return b && (
+      (a.y === point.y && b.y === point.y && Math.min(a.x, b.x) < point.x && point.x < Math.max(a.x, b.x)) ||
+      (a.x === point.x && b.x === point.x && Math.min(a.y, b.y) < point.y && point.y < Math.max(a.y, b.y))
+    );
+  });
 }
 
-// 将同一条上层导线上相邻、桥拱会重叠的交叉点合并为一组。
-// 分组键包含上层线、局部方向与垂直偏移，避免把同线不同平行段误合并。
+// 只有同一直段上紧邻的越过才合并，桥在折点和 T 接点前回到原线。
 export function groupBridgeCrossings(state, crossings) {
-  const byKey = new Map();
+  const bySegment = new Map();
   for (const crossing of crossings || []) {
-    const over = state.wires[crossing.overWireId];
-    const under = state.wires[crossing.underWireId];
-    if (!over || !under) {
-      continue;
+    const { overWireId, point } = crossing;
+    const points = state.wires[overWireId]?.points;
+    if (!points) continue;
+    const segmentIndex = crossedSegment(points, point);
+    if (segmentIndex === -1) continue;
+
+    const a = points[segmentIndex];
+    const b = points[segmentIndex + 1];
+    const direction = { x: Math.sign(b.x - a.x), y: Math.sign(b.y - a.y) };
+    const key = overWireId + ':' + segmentIndex;
+    let segment = bySegment.get(key);
+    if (!segment) {
+      segment = { overWireId, segmentIndex, direction, items: [] };
+      bySegment.set(key, segment);
     }
-    const overDir = localDirection(over.points, crossing.point);
-    const underDir = localDirection(under.points, crossing.point);
-    if (!overDir || !underDir) {
-      continue;
-    }
-    const offset = crossing.point.x * -overDir.y + crossing.point.y * overDir.x;
-    const key = crossing.overWireId + '|' + overDir.x + ',' + overDir.y + '|' + offset;
-    let group = byKey.get(key);
-    if (!group) {
-      group = { overWireId: crossing.overWireId, overDir, items: [] };
-      byKey.set(key, group);
-    }
-    group.items.push({
-      crossing,
-      underWireId: crossing.underWireId,
-      underDir,
-      s: crossing.point.x * overDir.x + crossing.point.y * overDir.y
-    });
+    segment.items.push({ point, distance: point.x * direction.x + point.y * direction.y });
   }
 
-  const merged = [];
-  for (const group of byKey.values()) {
-    group.items.sort(function (a, b) { return a.s - b.s; });
-    let current = null;
-    for (const item of group.items) {
-      if (!current || item.s - current.lastS > BRIDGE_MERGE_DISTANCE) {
-        current = { overWireId: group.overWireId, overDir: group.overDir, items: [] };
-        merged.push(current);
+  const groups = [];
+  for (const { overWireId, segmentIndex, direction, items } of bySegment.values()) {
+    items.sort((a, b) => a.distance - b.distance);
+    let group;
+    let previousDistance;
+    for (const item of items) {
+      if (!group || item.distance - previousDistance > WIRE_GRID) {
+        group = { overWireId, segmentIndex, direction, items: [] };
+        groups.push(group);
       }
-      current.items.push(item);
-      current.lastS = item.s;
+      group.items.push(item);
+      previousDistance = item.distance;
     }
   }
-  return merged;
+  return groups;
 }
 
-function eraseSegment(ctx, view, a, b, width) {
-  const p1 = worldToScreen(a, view);
-  const p2 = worldToScreen(b, view);
-  ctx.save();
-  ctx.strokeStyle = '#1b1b1b';
-  ctx.lineWidth = width;
-  ctx.lineCap = 'butt';
-  ctx.beginPath();
-  ctx.moveTo(p1.x, p1.y);
-  ctx.lineTo(p2.x, p2.y);
-  ctx.stroke();
-  ctx.restore();
-}
-
-function strokeLocalSegment(ctx, view, a, b, color, width) {
-  const p1 = worldToScreen(a, view);
-  const p2 = worldToScreen(b, view);
-  ctx.save();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = width;
-  ctx.lineCap = 'butt';
-  ctx.beginPath();
-  ctx.moveTo(p1.x, p1.y);
-  ctx.lineTo(p2.x, p2.y);
-  ctx.stroke();
-  ctx.restore();
-}
-
-function isSelectedWire(selection, wireId) {
-  if (!selection) {
-    return false;
+// 直接画出上层导线的弧线，保留下层线、相邻导线和网格。
+function traceBridge(ctx, view, group) {
+  const { direction, items } = group;
+  // 路径方向决定绘制顺序，桥顶固定在图纸的左侧或上侧。
+  const normal = direction.x === 0 ? { x: -1, y: 0 } : { x: 0, y: -1 };
+  const first = items[0].point;
+  const last = items[items.length - 1].point;
+  function screenPoint(point, along, lift) {
+    return worldToScreen({
+      x: point.x + direction.x * along + normal.x * lift,
+      y: point.y + direction.y * along + normal.y * lift
+    }, view);
   }
-  if (selection.kind === 'wire') {
-    return selection.id === wireId;
-  }
-  if (selection.kind === 'multi' && Array.isArray(selection.wires)) {
-    return selection.wires.indexOf(wireId) !== -1;
-  }
-  return false;
-}
+  const start = screenPoint(first, -BRIDGE_SPAN, 0);
+  const end = screenPoint(last, BRIDGE_SPAN, 0);
+  ctx.lineTo(start.x, start.y);
 
-// 交叉处画桥拱：上层线隆起，下层线保持连续（不断开）。
-// 同一上层线的多个相邻交叉合并：上升 → 跨越整组 → 下降。
-function drawBridges(ctx, state, view, selection, oscillatingWires, pulse) {
-  const groups = groupBridgeCrossings(state, findCrossings(state));
-  for (const group of groups) {
-    const over = state.wires[group.overWireId];
-    if (!over || group.items.length === 0) {
-      continue;
-    }
-    const overSelected = isSelectedWire(selection, group.overWireId);
-    const overOscillating = oscillatingWires && oscillatingWires.has(group.overWireId);
-    const overColor = overOscillating ? pulse.color : overSelected ? ACCENT : WIRE_COLOR;
-    const overWidth = overOscillating ? pulse.width : overSelected ? 4.5 : 2;
-    const first = group.items[0];
-    const last = group.items[group.items.length - 1];
-    const dir = group.overDir;
-    const start = { x: first.crossing.point.x - dir.x * BRIDGE_SPAN, y: first.crossing.point.y - dir.y * BRIDGE_SPAN };
-    const end = { x: last.crossing.point.x + dir.x * BRIDGE_SPAN, y: last.crossing.point.y + dir.y * BRIDGE_SPAN };
-
-    // 1) 擦掉上层线在整组交叉处的直线段。
-    eraseSegment(ctx, view, start, end, overOscillating && overSelected ? 9 : 7);
-
-    // 2) 逐条补回下层线被擦掉的交叉段。
-    for (const item of group.items) {
-      const underSelected = isSelectedWire(selection, item.underWireId);
-      const underOscillating = oscillatingWires && oscillatingWires.has(item.underWireId);
-      const underColor = underOscillating ? pulse.color : underSelected ? ACCENT : WIRE_COLOR;
-      const underWidth = underOscillating ? pulse.width : underSelected ? 4.5 : 2;
-      if (underSelected && underOscillating) {
-        strokeLocalSegment(ctx, view,
-          { x: item.crossing.point.x - item.underDir.x * BRIDGE_SPAN, y: item.crossing.point.y - item.underDir.y * BRIDGE_SPAN },
-          { x: item.crossing.point.x + item.underDir.x * BRIDGE_SPAN, y: item.crossing.point.y + item.underDir.y * BRIDGE_SPAN },
-          ACCENT, 6.5);
-      }
-      strokeLocalSegment(
-        ctx,
-        view,
-        { x: item.crossing.point.x - item.underDir.x * BRIDGE_SPAN, y: item.crossing.point.y - item.underDir.y * BRIDGE_SPAN },
-        { x: item.crossing.point.x + item.underDir.x * BRIDGE_SPAN, y: item.crossing.point.y + item.underDir.y * BRIDGE_SPAN },
-        underColor,
-        underWidth
-      );
-    }
-
-    // 3) 画桥。单个交叉保持原有拱形；多个交叉合并为带平台的一座桥。
-    const normal = { x: dir.y, y: -dir.x };
-    const pa = worldToScreen(start, view);
-    const pb = worldToScreen(end, view);
-    ctx.save();
-    ctx.strokeStyle = overColor;
-    ctx.lineWidth = overWidth;
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(pa.x, pa.y);
-    if (group.items.length === 1) {
-      const control = {
-        x: first.crossing.point.x + normal.x * BRIDGE_LIFT,
-        y: first.crossing.point.y + normal.y * BRIDGE_LIFT
-      };
-      const pc = worldToScreen(control, view);
-      ctx.quadraticCurveTo(pc.x, pc.y, pb.x, pb.y);
-    } else {
-      const topStart = {
-        x: first.crossing.point.x + normal.x * BRIDGE_LIFT,
-        y: first.crossing.point.y + normal.y * BRIDGE_LIFT
-      };
-      const topEnd = {
-        x: last.crossing.point.x + normal.x * BRIDGE_LIFT,
-        y: last.crossing.point.y + normal.y * BRIDGE_LIFT
-      };
-      const rise1 = { x: start.x + dir.x * BRIDGE_JOIN, y: start.y + dir.y * BRIDGE_JOIN };
-      const rise2 = { x: topStart.x - dir.x * BRIDGE_JOIN, y: topStart.y - dir.y * BRIDGE_JOIN };
-      const fall1 = { x: topEnd.x + dir.x * BRIDGE_JOIN, y: topEnd.y + dir.y * BRIDGE_JOIN };
-      const fall2 = { x: end.x - dir.x * BRIDGE_JOIN, y: end.y - dir.y * BRIDGE_JOIN };
-      const p1 = worldToScreen(rise1, view);
-      const p2 = worldToScreen(rise2, view);
-      const p3 = worldToScreen(topStart, view);
-      const p4 = worldToScreen(topEnd, view);
-      const p5 = worldToScreen(fall1, view);
-      const p6 = worldToScreen(fall2, view);
-      ctx.bezierCurveTo(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
-      ctx.lineTo(p4.x, p4.y);
-      ctx.bezierCurveTo(p5.x, p5.y, p6.x, p6.y, pb.x, pb.y);
-    }
-    if (overSelected && overOscillating) {
-      ctx.strokeStyle = ACCENT;
-      ctx.lineWidth = 6.5;
-      ctx.stroke();
-      ctx.strokeStyle = overColor;
-      ctx.lineWidth = overWidth;
-    }
-    ctx.stroke();
-    ctx.restore();
-  }
+  const topStart = screenPoint(first, 0, BRIDGE_LIFT);
+  const topEnd = screenPoint(last, 0, BRIDGE_LIFT);
+  const rise1 = screenPoint(first, -BRIDGE_SPAN / 2, 0);
+  const rise2 = screenPoint(first, -BRIDGE_SPAN / 2, BRIDGE_LIFT);
+  const fall1 = screenPoint(last, BRIDGE_SPAN / 2, BRIDGE_LIFT);
+  const fall2 = screenPoint(last, BRIDGE_SPAN / 2, 0);
+  ctx.bezierCurveTo(rise1.x, rise1.y, rise2.x, rise2.y, topStart.x, topStart.y);
+  if (items.length > 1) ctx.lineTo(topEnd.x, topEnd.y);
+  ctx.bezierCurveTo(fall1.x, fall1.y, fall2.x, fall2.y, end.x, end.y);
 }
 
 function drawEndpoints(ctx, state, view, oscillatingWires, pulse) {
@@ -768,20 +657,21 @@ function drawComponent(ctx, component, view, evaluation, definitionOptions = {})
 }
 
 // 管脚形状：IN 空心圆，OUT 实心方块；形状本身表达方向，不依赖颜色。
-function drawPinShape(ctx, world, view, dir) {
+function drawPinShape(ctx, world, view, dir, high) {
   const point = worldToScreen(world, view);
+  const color = high ? PIN_HIGH_COLOR : '#e2e2e2';
   ctx.save();
   if (dir === 'in') {
     ctx.beginPath();
     ctx.arc(point.x, point.y, PIN_RADIUS, 0, Math.PI * 2);
-    ctx.fillStyle = '#1b1b1b';
+    ctx.fillStyle = high ? color : '#1b1b1b';
     ctx.fill();
-    ctx.strokeStyle = '#e2e2e2';
+    ctx.strokeStyle = color;
     ctx.lineWidth = PIN_STROKE_WIDTH;
     ctx.stroke();
   } else {
     const half = PIN_RADIUS;
-    ctx.fillStyle = '#e2e2e2';
+    ctx.fillStyle = color;
     ctx.fillRect(point.x - half, point.y - half, half * 2, half * 2);
   }
   ctx.restore();
@@ -916,7 +806,7 @@ function pinLabelsOverlap(entries, width, height) {
   return false;
 }
 
-function drawPins(ctx, state, view, definitions, hoverPin, width, height) {
+function drawPins(ctx, state, view, definitions, hoverPin, width, height, previewValues) {
   const labels = [];
   ctx.save();
   ctx.font = PIN_LABEL_FONT;
@@ -925,16 +815,21 @@ function drawPins(ctx, state, view, definitions, hoverPin, width, height) {
     const defs = componentPins(component, definitions) || [];
     for (const def of defs) {
       const world = pinWorld(component, def.id, definitions);
-      drawPinShape(ctx, world, view, def.dir);
+      const high = previewValues?.[def.id] === 1;
+      drawPinShape(ctx, world, view, def.dir, high);
       if (component.type !== 'CUSTOM' || !def.label) {
         continue;
       }
       const textWidth = ctx.measureText(def.label).width;
+      const layout = pinLabelLayout(component, def, view, definitions, textWidth);
+      if (previewValues) {
+        drawPreviewPinValue(ctx, worldToScreen(world, view), layout.side, previewValues[def.id]);
+      }
       labels.push({
         componentId,
         pinId: def.id,
         text: def.label,
-        layout: pinLabelLayout(component, def, view, definitions, textWidth)
+        layout
       });
     }
   }
@@ -949,6 +844,23 @@ function drawPins(ctx, state, view, definitions, hoverPin, width, height) {
     }
     drawPinLabel(ctx, entry);
   }
+}
+
+function drawPreviewPinValue(ctx, point, side, bit) {
+  const inward = PIN_VALUE_INWARD[side];
+  const inset = PIN_LABEL_GAP + PIN_LABEL_HEIGHT / 2;
+  const x = point.x + inward.x * inset;
+  const y = point.y + inward.y * inset;
+  const value = bit === null ? '—' : bit === 1 ? '1' : '0';
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#252c33';
+  ctx.strokeText(value, x, y);
+  ctx.fillStyle = bit === 1 ? PIN_HIGH_COLOR : '#e2e2e2';
+  ctx.fillText(value, x, y);
+  ctx.restore();
 }
 
 function drawPinHover(ctx, view, pin) {
@@ -1110,7 +1022,7 @@ function drawPortAnnotations(ctx, view, annotations, selectedPortId) {
   ctx.restore();
 }
 
-function drawWireSelection(ctx, state, view, selection, oscillatingWires) {
+function drawWireSelection(ctx, state, view, selection, oscillatingWires, wireBridges) {
   if (!selection) {
     return;
   }
@@ -1124,7 +1036,7 @@ function drawWireSelection(ctx, state, view, selection, oscillatingWires) {
     const wire = state.wires[id];
     if (wire) {
       strokePolyline(ctx, wire.points, view, ACCENT,
-        oscillatingWires && oscillatingWires.has(id) ? 6.5 : 4.5);
+        oscillatingWires.has(id) ? 6.5 : 4.5, null, wireBridges.get(id));
     }
   }
 }
@@ -1242,6 +1154,9 @@ function drawWireDrag(ctx, view, drag) {
     color = '#8a8a8a';
   }
   strokePolyline(ctx, drag.points, view, color, 2, [8, 6]);
+  for (const branch of drag.branches || []) {
+    strokePolyline(ctx, branch.points, view, color, 2, [8, 6]);
+  }
 }
 
 function drawPreview(ctx, view, preview) {
@@ -1437,7 +1352,7 @@ export function previewPortLabelRects(width, height, definition, ctx, zoom) {
 
 // 详情面板中的封装外观预览：外层矩形 + R×C 单元格 + 名称 + 管脚。
 // 详情面板中的封装外观预览：外层矩形 + R×C 单元格 + 名称 + 管脚。
-export function drawDefinitionPreview(ctx, width, height, definition, selectedPortId, dropState, showSlots, zoom, hoveredPortId) {
+export function drawDefinitionPreview(ctx, width, height, definition, selectedPortId, dropState, showSlots, zoom, hoveredPortId, portValues) {
   ctx.clearRect(0, 0, width, height);
   const geometry = definitionPreviewGeometry(width, height, definition, zoom);
   if (!geometry) {
@@ -1486,7 +1401,7 @@ export function drawDefinitionPreview(ctx, width, height, definition, selectedPo
 
   drawPins(ctx, { components: { __preview__: component } }, view, definitions,
     hoveredPortId ? { componentId: '__preview__', pinId: hoveredPortId } : null,
-    width, height);
+    width, height, portValues);
   if (showSlots || (dropState && dropState.active)) {
     const slots = previewPortSlots(width, height, definition, zoom);
     const active = Boolean(dropState && dropState.active);
@@ -1551,16 +1466,22 @@ export function render(ctx, width, height, state, view, ui, evaluation) {
   gridLines(ctx, view, width, height);
   drawFrames(ctx, state, view, overlay.selection);
 
+  const wireBridges = new Map();
+  for (const bridge of groupBridgeCrossings(state, findCrossings(state))) {
+    if (!wireBridges.has(bridge.overWireId)) wireBridges.set(bridge.overWireId, new Map());
+    const segments = wireBridges.get(bridge.overWireId);
+    if (!segments.has(bridge.segmentIndex)) segments.set(bridge.segmentIndex, []);
+    segments.get(bridge.segmentIndex).push(bridge);
+  }
   for (const wireId of Object.keys(state.wires)) {
     const wire = state.wires[wireId];
-    strokePolyline(ctx, wire.points, view, WIRE_COLOR, 2);
+    strokePolyline(ctx, wire.points, view, WIRE_COLOR, 2, null, wireBridges.get(wireId));
   }
-  drawWireSelection(ctx, state, view, overlay.selection, oscillatingWires);
-  // Redraw the same wire geometry before bridges restore over/under separation.
+  drawWireSelection(ctx, state, view, overlay.selection, oscillatingWires, wireBridges);
   for (const wireId of oscillatingWires) {
-    strokePolyline(ctx, state.wires[wireId].points, view, pulse.color, pulse.width);
+    strokePolyline(ctx, state.wires[wireId].points, view, pulse.color, pulse.width,
+      null, wireBridges.get(wireId));
   }
-  drawBridges(ctx, state, view, overlay.selection, oscillatingWires, pulse);
   drawEndpoints(ctx, state, view, oscillatingWires, pulse);
 
   for (const componentId of Object.keys(state.components)) {

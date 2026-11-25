@@ -163,7 +163,6 @@ export function createController(context) {
     if (context.componentBar.setHiddenTypes) context.componentBar.setHiddenTypes(['CLOCK']);
     context.componentBar.setActive(null);
     context.toolBar.setActive(null);
-    context.resetEncapSections();
     context.syncDraftPanel();
     context.app.view = context.draftInitialView(draft);
     context.updateCursor();
@@ -351,7 +350,6 @@ export function createController(context) {
       context.app.placeDefinitionId
     );
     context.toolBar.setActive(context.app.mode === 'select' ? null : context.app.tool);
-    context.resetEncapSections();
     context.syncDraftPanel();
     context.updateCursor();
     context.updatePlacementHint();

@@ -1,13 +1,52 @@
-// 封装预览：独立画布命中、缩放与拖动。
-import { draftDisplayName } from "./encapsulation-model.js";
+// 封装预览：独立画布命中、缩放、管脚布局与测试。
+import { draftDisplayName, draftTestValues } from "./encapsulation-model.js";
 import { slotOffset } from '../core/geometry.js';
 import { drawDefinitionPreview, previewPortSlots, previewZoomBounds } from './view.js';
+
+const PREVIEW_PORT_REVEAL_DELAY_MS = 500;
 
 // context 显式注入所需的应用对象、元素、服务与跨模块回调。
 export function createPreview(context) {
   let previewPortDrag = null;
+  let testPress = null;
   let previewHoverPortId = null;
-  function resetInteraction() { previewPortDrag = null; previewHoverPortId = null; }
+  let activeDraft = null;
+  let mode = 'layout';
+  let revealTimer = null;
+
+  function getMode() {
+    return activeDraft === context.app?.draft ? mode : 'layout';
+  }
+
+  function resetInteraction() {
+    cancelPortReveal();
+    const gesture = previewPortDrag || testPress;
+    previewPortDrag = null;
+    testPress = null;
+    previewHoverPortId = null;
+    if (gesture) releasePreviewCapture(gesture);
+  }
+
+  function cancelPortReveal() {
+    if (revealTimer === null) return;
+    clearTimeout(revealTimer);
+    revealTimer = null;
+  }
+
+  function setMode(nextMode) {
+    const draft = context.app.draft;
+    if (!draft) return;
+    if (nextMode === getMode()) {
+      context.updateMode?.(nextMode, draft);
+      return;
+    }
+    resetInteraction();
+    context.cancelBoardPortDrag?.();
+    mode = nextMode;
+    activeDraft = draft;
+    context.updateMode?.(mode, activeDraft);
+    context.app.setPortDrag(null);
+  }
 
   function draftPreviewDefinition(draft) {
     return {
@@ -20,7 +59,7 @@ export function createPreview(context) {
   }
 
   function previewPortTarget(draft, clientX, clientY, portId) {
-    if (!draft || !context.encapPreview) {
+    if (!draft || !context.encapPreview || getMode() !== 'layout') {
       return null;
     }
     const rect = context.encapPreview.getBoundingClientRect();
@@ -77,9 +116,27 @@ export function createPreview(context) {
   }
 
   function handlePreviewPointerDown(event) {
-    if (event.button !== 0 || !context.app.draft) {
+    const draft = context.app.draft;
+    if (event.button !== 0 || !draft || previewPortDrag || testPress) {
       return;
     }
+    cancelPortReveal();
+    const currentMode = getMode();
+    if (currentMode === 'test') {
+      const pin = previewPinAt(event.clientX, event.clientY);
+      const port = pin && draft.ports.find(item => item.id === pin.portId);
+      if (draft.inspection || port?.direction !== 'in' ||
+          Object.hasOwn(draftTestValues(draft).pausedInputs, port.id)) return;
+      testPress = {
+        portId: port.id,
+        start: { x: event.clientX, y: event.clientY },
+        pointerId: event.pointerId
+      };
+      capturePreviewPointer(event);
+      event.preventDefault();
+      return;
+    }
+    if (currentMode !== 'layout') return;
     if (context.app.getMode() === 'erase-port') {
       const erasePin = previewPinAt(event.clientX, event.clientY);
       if (erasePin) {
@@ -99,15 +156,16 @@ export function createPreview(context) {
     event.preventDefault();
     context.app.setSelection({ kind: 'port', id: pin.portId });
     context.app.render();
-    if (context.app.isReadOnlyDraft()) {
-      return;
-    }
     previewPortDrag = {
       portId: pin.portId,
       start: { x: event.clientX, y: event.clientY },
       moved: false,
       pointerId: event.pointerId
     };
+    capturePreviewPointer(event);
+  }
+
+  function capturePreviewPointer(event) {
     try {
       context.encapPreview.setPointerCapture(event.pointerId);
     } catch (error) {
@@ -115,17 +173,24 @@ export function createPreview(context) {
     }
   }
 
+  function movedFromStart(event, gesture) {
+    return Math.hypot(event.clientX - gesture.start.x, event.clientY - gesture.start.y) >= 4;
+  }
+
   function handlePreviewPointerMove(event) {
+    if (testPress) {
+      if (event.pointerId !== testPress.pointerId) return;
+      if (movedFromStart(event, testPress)) testPress.moved = true;
+    }
     if (!previewPortDrag) {
       updatePreviewHover(event.clientX, event.clientY);
       return;
     }
-    const dx = event.clientX - previewPortDrag.start.x;
-    const dy = event.clientY - previewPortDrag.start.y;
-    if (!previewPortDrag.moved && Math.hypot(dx, dy) >= 4) {
+    if (event.pointerId !== previewPortDrag.pointerId) return;
+    if (movedFromStart(event, previewPortDrag)) {
       previewPortDrag.moved = true;
     }
-    if (!previewPortDrag.moved) {
+    if (!previewPortDrag.moved || context.app.isReadOnlyDraft()) {
       return;
     }
     const target = context.app.previewPortTarget(event.clientX, event.clientY, previewPortDrag.portId);
@@ -155,22 +220,45 @@ export function createPreview(context) {
   }
 
   function handlePreviewPointerUp(event) {
-    if (!previewPortDrag) {
+    if (testPress && testPress.pointerId === event.pointerId) {
+      const press = testPress;
+      testPress = null;
+      releasePreviewCapture(event);
+      if (getMode() !== 'test' || press.moved || movedFromStart(event, press)) return;
+      const pin = previewPinAt(event.clientX, event.clientY);
+      if (pin?.portId !== press.portId) return;
+      context.toggleDraftInput(pin.portId);
+      return;
+    }
+    if (!previewPortDrag || previewPortDrag.pointerId !== event.pointerId) {
       return;
     }
     const drag = previewPortDrag;
     previewPortDrag = null;
-    if (drag.moved) {
+    if (drag.moved && !context.app.isReadOnlyDraft()) {
       context.app.dropPortAt(event.clientX, event.clientY, drag.portId);
     } else {
       context.app.setPortDrag(null);
+      const pin = previewPinAt(event.clientX, event.clientY);
+      if (!drag.moved && !movedFromStart(event, drag) && pin?.portId === drag.portId) {
+        // 等待双击改名，避免第一次点击的滚动移动第二次点击的目标。
+        revealTimer = setTimeout(() => {
+          revealTimer = null;
+          context.revealDraftPort?.(drag.portId);
+        }, PREVIEW_PORT_REVEAL_DELAY_MS);
+      }
     }
     releasePreviewCapture(event);
     context.app.render();
   }
 
   function handlePreviewPointerCancel(event) {
-    if (!previewPortDrag) {
+    if (testPress && testPress.pointerId === event.pointerId) {
+      testPress = null;
+      releasePreviewCapture(event);
+      return;
+    }
+    if (!previewPortDrag || previewPortDrag.pointerId !== event.pointerId) {
       return;
     }
     previewPortDrag = null;
@@ -192,9 +280,10 @@ export function createPreview(context) {
   }
 
   function handlePreviewDoubleClick(event) {
-    if (event.button !== 0 || !context.app.draft || context.app.getMode() === 'erase-port') {
+    if (event.button !== 0 || !context.app.draft || getMode() !== 'layout' || context.app.getMode() === 'erase-port') {
       return;
     }
+    cancelPortReveal();
     const label = context.app.previewPortLabelAt ? context.app.previewPortLabelAt(event.clientX, event.clientY) : null;
     const pin = label ? null : previewPinAt(event.clientX, event.clientY);
     const portId = label ? label.portId : (pin ? pin.portId : null);
@@ -235,6 +324,12 @@ export function createPreview(context) {
       return;
     }
     const draft = context.app.draft;
+    if (draft !== activeDraft) {
+      resetInteraction();
+      activeDraft = draft;
+      mode = 'layout';
+      context.updateMode?.(mode, activeDraft);
+    }
     const rect = context.encapPreview.getBoundingClientRect();
     const width = Math.max(1, Math.round(rect.width));
     const height = Math.max(1, Math.round(rect.height));
@@ -259,18 +354,26 @@ export function createPreview(context) {
       ctx.clearRect(0, 0, width, height);
       return;
     }
+    const layout = mode === 'layout';
+    const testing = mode === 'test';
+    const values = testing ? draftTestValues(draft) : null;
+    const pinValues = values ? { ...values.inputs, ...values.outputs } : null;
+    if (values) {
+      for (const id of Object.keys(values.pausedInputs)) pinValues[id] = null;
+    }
     drawDefinitionPreview(
       ctx,
       width,
       height,
       draftPreviewDefinition(draft),
-      context.app.selection.kind === 'port' ? context.app.selection.id : null,
-      context.app.overlay.portDrag,
-      !draft.readOnly,
+      layout && context.app.selection.kind === 'port' ? context.app.selection.id : null,
+      layout ? context.app.overlay.portDrag : null,
+      layout && !draft.readOnly,
       draft.previewZoom,
-      previewHoverPortId
+      previewHoverPortId,
+      pinValues
     );
   }
 
-  return { draftPreviewDefinition, handlePreviewDoubleClick, handlePreviewPointerCancel, handlePreviewPointerDown, handlePreviewPointerLeave, handlePreviewPointerMove, handlePreviewPointerUp, handlePreviewWheel, moveDraftPortToSlot, previewPortTarget, renderDraftPreview, resetInteraction };
+  return { draftPreviewDefinition, getMode, handlePreviewDoubleClick, handlePreviewPointerCancel, handlePreviewPointerDown, handlePreviewPointerLeave, handlePreviewPointerMove, handlePreviewPointerUp, handlePreviewWheel, moveDraftPortToSlot, previewPortTarget, renderDraftPreview, resetInteraction, setMode };
 }

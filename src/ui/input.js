@@ -40,15 +40,22 @@ import {
   dragWireSegment,
   previewAttachFreeEnd,
   attachFreeEnd,
+  previewMoveFreeEnd,
   moveFreeEnd,
   previewCreateFreeWire,
   createFreeWire,
   previewCreateAnchoredFreeWire,
   createAnchoredFreeWire,
+  previewExtendFreeWire,
+  extendFreeWire,
   previewMergeFreeEnds,
   mergeFreeEnds,
   previewDetachPinEnd,
   detachPinEnd,
+  previewDetachJunctionEnd,
+  detachJunctionEnd,
+  previewReconnectJunctionEnd,
+  reconnectJunctionEnd,
   addFrameCommand,
   updateFrameCommand,
   moveFrameCommand,
@@ -62,6 +69,7 @@ import {
   hitButtonSwitch,
   nearestAnnotatable,
   nearestFreeEnd,
+  nearestJunctionEnd,
   nearestPin,
   nearestWirePoint,
   resolveAnchor,
@@ -227,10 +235,7 @@ export function attachInput(options) {
     endpointDrag = null;
     freeDraw = null;
     panDrag = null;
-    if (portDrag) {
-      portDrag = null;
-      app.setPortDrag(null);
-    }
+    cancelPortDrag();
     clearOverlays();
   }
 
@@ -475,6 +480,37 @@ export function attachInput(options) {
     commitConnect(start, end, keepActive);
   }
 
+  function freeDrawTarget(state, start, screen, definitions) {
+    const view = app.getView();
+    const world = screenToWorld(screen, view);
+    const end = nearestFreeEnd(state, view, world);
+    const body = nearestWirePoint(state, view, world);
+    if (end || body) {
+      const pin = nearestPin(state, view, world, { definitions });
+      const hit = end && (!body || end.dist <= body.dist) ? end : body;
+      if (!pin || hit.dist < pin.dist) {
+        if (hit === end) {
+          return { kind: 'end', point: end.point, wireId: end.wireId, side: end.side };
+        }
+        return { kind: 'junction', point: body.anchor.point, wireId: body.anchor.wireId, anchor: body.anchor };
+      }
+    }
+    return { kind: 'free', point: freeLineEnd(start, world) };
+  }
+
+  function freeDrawCommand(state, start, target, definitions, preview) {
+    if (target.kind === 'end') {
+      const command = preview ? previewExtendFreeWire : extendFreeWire;
+      return command(state, target.wireId, target.side, start, { definitions });
+    }
+    if (target.kind === 'junction') {
+      const command = preview ? previewCreateAnchoredFreeWire : createAnchoredFreeWire;
+      return command(state, target.anchor, start, { definitions });
+    }
+    const command = preview ? previewCreateFreeWire : createFreeWire;
+    return command(state, start, target.point, { definitions });
+  }
+
   function updateFreeDraw(screen) {
     if (!freeDraw) {
       return;
@@ -486,22 +522,25 @@ export function attachInput(options) {
     }
     freeDraw.moved = true;
 
-    const world = screenToWorld(screen, app.getView());
-    const end = freeLineEnd(freeDraw.start, world);
-    const signature = end.x + ',' + end.y;
+    const state = app.getState();
+    const definitions = app.getDefinitions();
+    const target = freeDrawTarget(state, freeDraw.start, screen, definitions);
+    const signature = [target.kind, target.wireId, target.side, target.point.x, target.point.y].join(':');
     if (signature === freeDraw.signature) {
       return;
     }
     freeDraw.signature = signature;
 
-    const result = previewCreateFreeWire(app.getState(), freeDraw.start, end, { definitions: app.getDefinitions() });
+    const result = freeDrawCommand(state, freeDraw.start, target, definitions, true);
+    // 锚定悬空线按宿主→空白返回，画线预览按用户的拖动方向显示。
+    const points = result.ok
+      ? (target.kind === 'junction' ? result.points.slice().reverse() : result.points)
+      : rubberPoints(freeDraw.start, target.point);
     app.overlay.rubber = {
-      points: result.ok ? result.points : [freeDraw.start, end],
+      points,
       status: result.ok ? 'valid' : 'invalid'
     };
-    app.overlay.wireStart = { x: freeDraw.start.x, y: freeDraw.start.y };
-    app.overlay.hoverAnchor = null;
-    hoverKey = '';
+    setHover(target.kind === 'free' ? null : target.point);
     app.render();
   }
 
@@ -510,18 +549,24 @@ export function attachInput(options) {
     freeDraw = null;
     app.overlay.rubber = null;
     app.overlay.wireStart = null;
-    app.overlay.hoverAnchor = null;
-    if (!draw || !draw.moved) {
+    setHover(null);
+    if (!draw) {
       app.render();
       return;
     }
-    const world = screenToWorld(eventScreenPoint(event, canvas), app.getView());
-    const end = freeLineEnd(draw.start, world);
-    if (end.x === draw.start.x && end.y === draw.start.y) {
+    const screen = eventScreenPoint(event, canvas);
+    if (!draw.moved && Math.hypot(screen.x - draw.startScreen.x, screen.y - draw.startScreen.y) < 3) {
       app.render();
       return;
     }
-    const result = createFreeWire(app.getState(), draw.start, end, { definitions: app.getDefinitions() });
+    const state = app.getState();
+    const definitions = app.getDefinitions();
+    const target = freeDrawTarget(state, draw.start, screen, definitions);
+    if (target.point.x === draw.start.x && target.point.y === draw.start.y) {
+      app.render();
+      return;
+    }
+    const result = freeDrawCommand(state, draw.start, target, definitions, false);
     if (app.commit(result)) {
       app.setSelection({ kind: 'wire', id: result.id });
       // 默认创建一条新线后回到选择模式；按住 Ctrl/Cmd 时保持线工具激活。
@@ -880,10 +925,26 @@ export function attachInput(options) {
     });
   }
 
-  function cancelCopy() {
+  function clearCopyInteraction() {
+    const pickingBox = marquee?.mode === 'copy';
+    const redraw = Boolean(app.overlay.copyGhost || (pickingBox && app.overlay.marquee));
     resetCopySession();
-    app.overlay.marquee = null;
-    marquee = null;
+    if (pickingBox) {
+      marquee = null;
+      app.overlay.marquee = null;
+    }
+    return redraw;
+  }
+
+  function cancelCopyForModeChange(nextMode) {
+    const mode = app.getMode();
+    if (nextMode === mode || copySession.phase === 'idle') return false;
+    if (copySession.phase === 'pending' || mode === 'copy') return clearCopyInteraction();
+    return false;
+  }
+
+  function cancelCopy() {
+    clearCopyInteraction();
     if (app.getMode() === 'copy') {
       app.setMode('select');
     }
@@ -1208,14 +1269,14 @@ export function attachInput(options) {
     app.render();
   }
 
-  function startEndpointDrag(hit, screen, options = {}) {
+  function startEndpointDrag(hit, screen, sourceKind = 'free') {
     endpointDrag = {
       wireId: hit.wireId,
       side: hit.side,
       startScreen: { x: screen.x, y: screen.y },
       moved: false,
       signature: null,
-      detachPin: Boolean(options.detachPin)
+      sourceKind
     };
   }
 
@@ -1231,11 +1292,32 @@ export function attachInput(options) {
   function endpointDragTarget(state, drag, screen) {
     const view = app.getView();
     const world = screenToWorld(screen, view);
-    const pinHit = nearestPin(state, view, world, { definitions: app.getDefinitions() });
-    const freeHit = drag.detachPin
-      ? null
-      : nearestFreeEnd(state, view, world, { excludeWireId: drag.wireId });
-    // free 拖动优先合并；pin 脱开不吸附其他 free 端点。
+    const detachPin = drag.sourceKind === 'pin';
+    const detachJunction = drag.sourceKind === 'junction';
+    const point = snapToWireGridPoint(world);
+    if (!detachPin) {
+      const hit = detachJunction
+        ? nearestFreeEnd(state, view, point, { excludeWireId: drag.wireId })
+        : nearestJunctionEnd(state, view, point);
+      if (hit && hit.point.x === point.x && hit.point.y === point.y) {
+        const branchHit = detachJunction ? drag : hit;
+        const hostHit = detachJunction ? hit : drag;
+        const branch = state.wires[branchHit.wireId];
+        const end = branchHit.side === 'A' ? branch?.endA : branch?.endB;
+        if (end?.kind === 'junction' && end.wireId === hostHit.wireId) {
+          return {
+            kind: 'collapse-t', point, hover: point, pinAnchor: null,
+            signature: 'collapse-t:' + hit.wireId + ':' + hit.side,
+            args: [point]
+          };
+        }
+      }
+    }
+    const pinHit = detachJunction ? null : nearestPin(state, view, world, { definitions: app.getDefinitions() });
+    const freeHit = drag.sourceKind === 'free'
+      ? nearestFreeEnd(state, view, world, { excludeWireId: drag.wireId })
+      : null;
+    // 只有悬空端拖动可以直接和另一悬空端合并。
     if (freeHit) {
       return {
         kind: 'merge', point: freeHit.point, hover: freeHit.point, pinAnchor: null,
@@ -1248,19 +1330,20 @@ export function attachInput(options) {
       const kind = pinHit.connected ? 'used' : 'pin';
       return {
         kind, point: anchor.point, hover: anchor.point, pinAnchor: anchor,
-        signature: (drag.detachPin ? 'detach' : '') + kind + ':' + anchor.componentId + ':' + anchor.pinId,
-        args: drag.detachPin
+        signature: (detachPin ? 'detach' : '') + kind + ':' + anchor.componentId + ':' + anchor.pinId,
+        args: detachPin
           ? [anchor.point, { kind: 'pin', componentId: anchor.componentId, pinId: anchor.pinId }]
           : [anchor]
       };
     }
-    if (!drag.detachPin) {
+    if (!detachPin) {
       // 排除正在拖动的线，避免其旧线身遮蔽目标宿主。
       const wires = Object.assign({}, state.wires);
       delete wires[drag.wireId];
       const wireHit = nearestWirePoint({ ...state, wires }, view, world);
-      if (wireHit) {
-        const anchor = wireHit.anchor;
+      const anchor = wireHit?.anchor;
+      // 已连接的 T 端只吸附实际落下的网格点，邻近空白点仍可断接。
+      if (anchor && (!detachJunction || (anchor.point.x === point.x && anchor.point.y === point.y))) {
         return {
           kind: 'junction', point: anchor.point, hover: anchor.point, pinAnchor: null,
           signature: 'junction:' + anchor.wireId + ':' + anchor.point.x + ',' + anchor.point.y,
@@ -1268,18 +1351,25 @@ export function attachInput(options) {
         };
       }
     }
-    const point = { x: snapToWireGrid(world.x), y: snapToWireGrid(world.y) };
     return {
       kind: 'free', point, hover: null, pinAnchor: null,
-      signature: (drag.detachPin ? 'detachfree:' : 'free:') + point.x + ',' + point.y,
-      args: drag.detachPin ? [point, null] : [point]
+      signature: (detachPin ? 'detachfree:' : 'free:') + point.x + ',' + point.y,
+      args: detachPin ? [point, null] : [point]
     };
   }
 
   function endpointDragCommand(state, drag, target, preview) {
     let command;
-    if (drag.detachPin) {
+    if (drag.sourceKind === 'junction') {
+      if (target.kind === 'junction') {
+        command = preview ? previewReconnectJunctionEnd : reconnectJunctionEnd;
+      } else {
+        command = preview ? previewDetachJunctionEnd : detachJunctionEnd;
+      }
+    } else if (drag.sourceKind === 'pin') {
       command = preview ? previewDetachPinEnd : detachPinEnd;
+    } else if (target.kind === 'collapse-t') {
+      command = preview ? previewMoveFreeEnd : moveFreeEnd;
     } else if (target.kind === 'merge') {
       command = preview ? previewMergeFreeEnds : mergeFreeEnds;
     } else if (target.kind === 'pin' || target.kind === 'junction') {
@@ -1306,7 +1396,7 @@ export function attachInput(options) {
     let overlay = null;
     if (target.kind !== 'used') {
       const points = fixed ? rubberPoints(fixed, target.point) : null;
-      if (!endpointDrag.detachPin && target.kind === 'free') {
+      if (endpointDrag.sourceKind === 'free' && target.kind === 'free') {
         overlay = fixed ? { points, status: 'free' } : null;
       } else {
         const preview = endpointDragCommand(state, endpointDrag, target, true);
@@ -1333,16 +1423,20 @@ export function attachInput(options) {
 
     const state = app.getState();
     const target = endpointDragTarget(state, drag, eventScreenPoint(event, canvas));
+    const wire = state.wires[drag.wireId];
+    const source = drag.side === 'A' ? wire?.endA : wire?.endB;
+    if (source?.kind === 'junction' && target.point.x === source.point.x && target.point.y === source.point.y) {
+      app.render();
+      return;
+    }
     if (target.kind === 'used') {
-      const wire = state.wires[drag.wireId];
-      const end = drag.detachPin ? (drag.side === 'A' ? wire.endA : wire.endB) : null;
-      const returnedToSource = drag.detachPin && end && end.kind === 'pin' &&
-        end.componentId === target.pinAnchor.componentId && end.pinId === target.pinAnchor.pinId;
+      const returnedToSource = drag.sourceKind === 'pin' && source?.kind === 'pin' &&
+        source.componentId === target.pinAnchor.componentId && source.pinId === target.pinAnchor.pinId;
       if (!returnedToSource) app.commit({ ok: false, reason: REASONS.PIN_ALREADY_CONNECTED });
     } else {
       const result = endpointDragCommand(state, drag, target, false);
       if (app.commit(result)) {
-        const id = drag.detachPin || target.kind === 'merge' ? result.id : drag.wireId;
+        const id = target.kind === 'merge' ? result.id : drag.wireId;
         app.setSelection({ kind: 'wire', id });
       }
     }
@@ -1361,7 +1455,7 @@ export function attachInput(options) {
     };
   }
 
-  // 只取垂直于线段的分量；拖动过程中不改变其它顶点。
+  // 只取垂直于线段的分量，预览宿主和随线移动的支线。
   function updateWireDrag(screen) {
     if (!wireDrag) {
       return;
@@ -1384,26 +1478,16 @@ export function attachInput(options) {
       wireDrag.index,
       offset
     , { definitions: app.getDefinitions() });
-    const signature = result.points
-      ? (result.ok ? 'ok:' : 'bad:') +
-        result.points
-          .map(function (point) {
-            return point.x + ',' + point.y;
-          })
-          .join(';')
-      : 'none:' + (result.reason || '');
+    const preview = result.points && (!result.ok || result.delta !== 0)
+      ? { points: result.points, branches: result.branches, status: result.ok ? 'valid' : 'invalid' }
+      : null;
+    const signature = JSON.stringify(preview);
     if (signature === wireDrag.signature) {
       return;
     }
     wireDrag.signature = signature;
 
-    if (result.ok && result.delta !== 0) {
-      app.overlay.wireDrag = { points: result.points, status: 'valid' };
-    } else if (!result.ok && result.points) {
-      app.overlay.wireDrag = { points: result.points, status: 'invalid' };
-    } else {
-      app.overlay.wireDrag = null;
-    }
+    app.overlay.wireDrag = preview;
     app.render();
   }
 
@@ -1774,15 +1858,19 @@ export function attachInput(options) {
       return;
     }
 
-    // 悬空端点优先：靠近端点时拖动端点，而不是整段或从引脚起线。
+    // 先选端点所属导线；T 点属于支线，即使它落在宿主线身上。
     const freeEnd = nearestFreeEnd(state, view, world);
-    if (freeEnd) {
-      commitSelection('wire', freeEnd.wireId);
-      startEndpointDrag(freeEnd, screen);
-      try {
-        canvas.setPointerCapture(event.pointerId);
-      } catch (err) {
-        // 忽略。
+    const junctionEnd = nearestJunctionEnd(state, view, world);
+    const end = junctionEnd && (!freeEnd || junctionEnd.dist <= freeEnd.dist) ? junctionEnd : freeEnd;
+    if (end) {
+      commitSelection('wire', end.wireId);
+      if (!app.isReadOnlyDraft()) {
+        startEndpointDrag(end, screen, end === junctionEnd ? 'junction' : 'free');
+        try {
+          canvas.setPointerCapture(event.pointerId);
+        } catch (err) {
+          // 忽略。
+        }
       }
       return;
     }
@@ -1797,7 +1885,7 @@ export function attachInput(options) {
           const pinEnd = pinWireEnd(state, pinHit.anchor.componentId, pinHit.anchor.pinId);
           commitSelection('component', pinHit.anchor.componentId);
           if (pinEnd && !app.isReadOnlyDraft()) {
-            startEndpointDrag(pinEnd, screen, { detachPin: true });
+            startEndpointDrag(pinEnd, screen, 'pin');
             try {
               canvas.setPointerCapture(event.pointerId);
             } catch (err) {
@@ -1953,6 +2041,7 @@ export function attachInput(options) {
     }
 
     if (portDrag) {
+      if (event.pointerId !== portDrag.pointerId) return;
       const dx = screen.x - portDrag.start.x;
       const dy = screen.y - portDrag.start.y;
       if (!portDrag.moved && Math.hypot(dx, dy) >= 4) {
@@ -2049,6 +2138,14 @@ export function attachInput(options) {
     }
   }
 
+  function cancelPortDrag(pointerId) {
+    if (!portDrag || (pointerId !== undefined && portDrag.pointerId !== pointerId)) return;
+    const drag = portDrag;
+    portDrag = null;
+    app.setPortDrag(null);
+    releaseCapture(drag);
+  }
+
   function handlePointerUp(event) {
     if (activeButton) {
       releaseActiveButton();
@@ -2063,6 +2160,7 @@ export function attachInput(options) {
       return;
     }
     if (portDrag) {
+      if (event.pointerId !== portDrag.pointerId) return;
       const drag = portDrag;
       portDrag = null;
       if (drag.moved) {
@@ -2128,10 +2226,7 @@ export function attachInput(options) {
   function handlePointerCancel(event) {
     releaseActiveButton();
     cancelCtrlCopyDrag(event.pointerId);
-    if (portDrag) {
-      portDrag = null;
-      app.setPortDrag(null);
-    }
+    cancelPortDrag(event.pointerId);
     if (armed) {
       disarm();
     }
@@ -2151,6 +2246,7 @@ export function attachInput(options) {
       freeDraw = null;
       app.overlay.rubber = null;
       app.overlay.wireStart = null;
+      setHover(null);
     }
     if (marquee) {
       marquee = null;
@@ -2423,6 +2519,7 @@ export function attachInput(options) {
     }
 
     if (event.code === 'Space') {
+      if (target?.closest?.('#encap-inputs button[data-port-id]')) return;
       spaceHeld = true;
       event.preventDefault();
       return;
@@ -2486,6 +2583,7 @@ export function attachInput(options) {
   canvas.addEventListener('pointercancel', handlePointerCancel);
   canvas.addEventListener('lostpointercapture', function (event) {
     cancelCtrlCopyDrag(event.pointerId);
+    cancelPortDrag(event.pointerId);
   });
   canvas.addEventListener('pointerleave', handlePointerLeave);
   canvas.addEventListener('wheel', handleWheel, { passive: false });
@@ -2514,6 +2612,8 @@ export function attachInput(options) {
 
   return {
     cancel: cancelInputGestures,
+    cancelPortDrag,
+    cancelCopyForModeChange,
     trackRestoredButtons: function () {
       restoredButtons = new Set(Object.values(app.getState().components || {})
         .filter(component => component.type === 'BUTTON' && component.on)

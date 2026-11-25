@@ -2,7 +2,104 @@
 import { slotCount, slotOffset } from "../core/geometry.js";
 import { evaluateDynamic } from "../core/dynamic.js";
 import { buildNets } from "../core/nets.js";
-import { bindingNetId } from "../core/ports.js";
+import { bindingNetId, bindingValue } from "../core/ports.js";
+
+const draftRuntimes = new WeakMap();
+
+export function invalidateDraftRuntime(state) {
+  draftRuntimes.delete(state);
+}
+
+function cachedDraftRuntime(draft) {
+  let runtime = draftRuntimes.get(draft.state);
+  if (!runtime || runtime.library !== draft.library) {
+    runtime = { library: draft.library };
+    draftRuntimes.set(draft.state, runtime);
+  }
+  // 工作台的端口数组与字段可能原地修改。名称和槽位不影响求值。
+  const bindings = JSON.stringify(draft.ports.map(({ id, direction, binding }) => [
+    id, direction, binding?.kind, binding?.componentId, binding?.pinId, binding?.wireId
+  ]));
+  if (runtime.bindings !== bindings) {
+    runtime.bindings = bindings;
+    runtime.pausedInputs = null;
+    runtime.testValues = null;
+  }
+  return runtime;
+}
+
+function draftNets(draft, runtime) {
+  if (!runtime.built) {
+    runtime.built = buildNets(draft.state, { definitions: draft.library, includeBarePins: true });
+    runtime.netsById = new Map(runtime.built.nets.map(net => [net.id, net]));
+  }
+  return runtime.built;
+}
+
+function pausedDraftInputs(draft, runtime, inputs) {
+  if (runtime.pausedInputs) return runtime.pausedInputs;
+  const reasons = Object.create(null);
+  if (inputs.length) {
+    const built = draftNets(draft, runtime);
+    const inputsByNet = new Map();
+    for (const port of inputs) {
+      const net = runtime.netsById.get(bindingNetId(built, port.binding));
+      if (!net) {
+        reasons[port.id] = '管脚绑定已失效';
+      } else if (net.driverPins.length) {
+        reasons[port.id] = '内部 Net 已有驱动';
+      } else {
+        const netInputs = inputsByNet.get(net.id);
+        if (netInputs) netInputs.push(port.id);
+        else inputsByNet.set(net.id, [port.id]);
+      }
+    }
+    for (const portIds of inputsByNet.values()) {
+      if (portIds.length < 2) continue;
+      for (const portId of portIds) reasons[portId] = '多个测试输入绑定到同一个内部 Net';
+    }
+  }
+  runtime.pausedInputs = Object.freeze(reasons);
+  return runtime.pausedInputs;
+}
+
+function draftInputValue(draft, portId) {
+  return draft.inputs && Object.prototype.hasOwnProperty.call(draft.inputs, portId) &&
+    draft.inputs[portId] ? 1 : 0;
+}
+
+function draftOutputValues(draft, runtime) {
+  const evaluation = draft.evaluation;
+  const values = draft.ports.filter(port => port.direction === 'out').map(({ id, binding }) => {
+    const pinKey = binding?.kind === 'pin'
+      ? binding.componentId + ':' + binding.pinId
+      : null;
+    if (pinKey && evaluation?.pinValue &&
+        Object.prototype.hasOwnProperty.call(evaluation.pinValue, pinKey)) {
+      return [id, bindingValue(evaluation, null, binding)];
+    }
+    return [id, bindingValue(evaluation, draftNets(draft, runtime), binding)];
+  });
+  return Object.fromEntries(values);
+}
+
+export function draftTestValues(draft) {
+  const runtime = cachedDraftRuntime(draft);
+  const ports = draft.ports.filter(port => port.direction === 'in');
+  const bits = ports.map(port => draftInputValue(draft, port.id));
+  const inputBits = bits.join('');
+  if (runtime.testValues && runtime.evaluation === draft.evaluation && runtime.inputBits === inputBits) {
+    return runtime.testValues;
+  }
+  runtime.evaluation = draft.evaluation;
+  runtime.inputBits = inputBits;
+  runtime.testValues = Object.freeze({
+    inputs: Object.freeze(Object.fromEntries(ports.map((port, index) => [port.id, bits[index]]))),
+    outputs: Object.freeze(draftOutputValues(draft, runtime)),
+    pausedInputs: pausedDraftInputs(draft, runtime, ports)
+  });
+  return runtime.testValues;
+}
 
 export function cloneValue(value) {
   if (typeof structuredClone === 'function') {
@@ -37,24 +134,22 @@ export function draftPathHasDefinition(draft, definitionId) {
   });
 }
 
-export function draftExternalInputs(draft) {
-  return draft.ports.filter(function (port) {
-    return port.direction === 'in';
-  }).map(function (port) {
-    return {
+export function draftRuntimeOptions(draft) {
+  const inputs = draft.ports.filter(port => port.direction === 'in');
+  const paused = pausedDraftInputs(draft, cachedDraftRuntime(draft), inputs);
+  return {
+    definitions: draft.library,
+    includeBarePins: true,
+    externalInputs: inputs.filter(port => !paused[port.id]).map(port => ({
       portId: port.id,
       binding: port.binding,
-      value: draft.inputs[port.id] ? 1 : 0
-    };
-  });
+      value: draftInputValue(draft, port.id)
+    }))
+  };
 }
 
 export function evaluateDraft(draft, previous) {
-  return evaluateDynamic(draft.state, previous, undefined, {
-    definitions: draft.library,
-    includeBarePins: true,
-    externalInputs: draftExternalInputs(draft)
-  });
+  return evaluateDynamic(draft.state, previous, undefined, draftRuntimeOptions(draft));
 }
 
 export function resolvePortNet(draft, binding) {

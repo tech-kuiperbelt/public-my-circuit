@@ -974,11 +974,12 @@ layout: null
       flex: 1 1 auto;
       min-width: 0;
       height: 100%;
+      container: encap-panel / size;
       box-sizing: border-box;
       display: flex;
       flex-direction: column;
       gap: 8px;
-      padding: 12px;
+      padding: 0 12px 12px;
       overflow-y: auto;
       border: 0;
       border-left: 1px solid #344650;
@@ -988,6 +989,9 @@ layout: null
       box-shadow: none;
       font-size: 13px;
       pointer-events: auto;
+    }
+    #encap-panel > .encap-field:first-child {
+      margin-top: 12px;
     }
     #encap-panel[hidden] {
       display: none;
@@ -1387,9 +1391,22 @@ layout: null
     .encap-row .encap-field {
       flex: 1;
     }
+    #encap-preview-header {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: #161c20;
+    }
     .encap-preview-wrap {
       flex: 0 0 auto;
       width: 100%;
+      /* 给标签、间距和一行管脚留下空间。 */
+      max-width: max(96px, min(50vh, calc(100vh - 360px), calc(100cqh - 124px)));
+      align-self: center;
       aspect-ratio: 1 / 1;
       box-sizing: border-box;
       overflow: hidden;
@@ -1408,6 +1425,18 @@ layout: null
       gap: 6px;
       flex-wrap: wrap;
       align-items: center;
+    }
+    @container encap-panel (max-height: 220px) {
+      #encap-preview-header {
+        display: contents;
+      }
+      #encap-preview-tabs {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        flex: 0 0 auto;
+        background: #161c20;
+      }
     }
     .encap-badge {
       padding: 2px 6px;
@@ -1451,7 +1480,8 @@ layout: null
       border-color: #4f9bc4;
       background: #1f4356;
     }
-    .encap-actions button.active {
+    .encap-actions button.active,
+    .encap-actions button[aria-pressed="true"] {
       border-color: #ffd166;
       background: #4a4226;
       color: #ffe9a8;
@@ -1465,69 +1495,16 @@ layout: null
       margin-top: auto;
       padding-top: 4px;
     }
-    .encap-section-title {
-      margin-top: 4px;
-      color: #b9d3e2;
-      font-weight: 700;
-      font-size: 12px;
-      letter-spacing: 0.02em;
-    }
-    .encap-fold-section {
-      display: block;
-    }
-    .encap-fold-section > summary {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      cursor: pointer;
-      list-style: none;
-      user-select: none;
-    }
-    .encap-fold-section > summary::-webkit-details-marker {
-      display: none;
-    }
-    .encap-fold-section > summary::before {
-      content: "▸";
-      color: #7f98a5;
-      font-size: 11px;
-      line-height: 1;
-    }
-    .encap-fold-section[open] > summary::before {
-      content: "▾";
-    }
-    .encap-port-section > #encap-ports {
+    #encap-ports,
+    #encap-references {
       display: flex;
       flex-direction: column;
       gap: 6px;
-      margin-top: 6px;
     }
-    .encap-port-section:not([open]) > #encap-ports {
-      display: none;
-    }
-    .encap-input-section > #encap-inputs {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      margin-top: 6px;
-    }
-    .encap-input-section:not([open]) > #encap-inputs {
-      display: none;
-    }
-    .encap-reference-section > #encap-references {
-      display: flex;
-      flex-direction: column;
+    #encap-references {
       gap: 4px;
-      margin-top: 6px;
     }
-    .encap-reference-section:not([open]) > #encap-references {
-      display: none;
-    }
-    .encap-ref-node,
-    .encap-ref-root {
-      display: block;
-    }
-    .encap-ref-node > summary,
-    .encap-ref-root > summary {
+    .encap-ref-node > summary {
       display: flex;
       align-items: center;
       gap: 5px;
@@ -1537,23 +1514,19 @@ layout: null
       list-style: none;
       user-select: none;
     }
-    .encap-ref-node > summary::-webkit-details-marker,
-    .encap-ref-root > summary::-webkit-details-marker {
+    .encap-ref-node > summary::-webkit-details-marker {
       display: none;
     }
-    .encap-ref-node > summary::before,
-    .encap-ref-root > summary::before {
+    .encap-ref-node > summary::before {
       content: "▸";
       color: #7f98a5;
       font-size: 11px;
       line-height: 1;
     }
-    .encap-ref-node[open] > summary::before,
-    .encap-ref-root[open] > summary::before {
+    .encap-ref-node[open] > summary::before {
       content: "▾";
     }
-    .encap-ref-node > summary:hover,
-    .encap-ref-root > summary:hover {
+    .encap-ref-node > summary:hover {
       background: #223038;
     }
     .encap-ref-leaf {
@@ -1588,11 +1561,6 @@ layout: null
       font-size: 10px;
       line-height: 1.4;
       letter-spacing: 0.03em;
-    }
-    .encap-ref-badge-current {
-      border: 1px solid #7a6a3a;
-      background: #3a3324;
-      color: #ffe9a8;
     }
     .encap-ref-badge-definition {
       border: 1px solid #3c5f70;
@@ -1699,9 +1667,15 @@ layout: null
     }
     .encap-test-items {
       display: flex;
-      flex: 1;
       flex-wrap: wrap;
       gap: 5px;
+      min-width: 0;
+    }
+    .encap-test-groups {
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      gap: 6px;
       min-width: 0;
     }
     .encap-inputs button {
@@ -1731,6 +1705,10 @@ layout: null
       border-color: #ffd166;
       background: #4a4226;
       color: #ffe9a8;
+    }
+    .encap-test-items > button,
+    .encap-test-items > .encap-output {
+      padding-inline: 5px;
     }
 
     .boot-error {
@@ -1858,25 +1836,29 @@ layout: null
           <label class="encap-field">行 <input id="encap-rows" type="number" min="1" max="32" value="1"></label>
           <label class="encap-field">列 <input id="encap-cols" type="number" min="1" max="32" value="1"></label>
         </div>
-        <div class="encap-preview-wrap">
-          <canvas id="encap-preview" class="encap-preview" aria-label="元件外观预览" title="元件外观预览"></canvas>
+        <div id="encap-preview-header">
+          <div class="encap-preview-wrap">
+            <canvas id="encap-preview" class="encap-preview" aria-label="元件外观预览" title="元件外观预览"></canvas>
+          </div>
+          <div id="encap-preview-tabs" class="encap-actions" role="group" aria-label="元件预览模式">
+            <button id="encap-preview-layout" type="button" aria-pressed="true" aria-controls="encap-port-section">布局</button>
+            <button id="encap-preview-test" type="button" aria-pressed="false" aria-controls="encap-input-section">测试</button>
+            <button id="encap-preview-references" type="button" aria-pressed="false" aria-controls="encap-reference-section">被引用</button>
+          </div>
         </div>
         <div class="encap-actions">
           <button id="encap-annotate" type="button">标注管脚</button>
           <button id="encap-remove-port" type="button">移除管脚</button>
         </div>
-        <details class="encap-fold-section encap-port-section">
-          <summary class="encap-section-title">管脚</summary>
+        <div id="encap-port-section" role="region" aria-labelledby="encap-preview-layout">
           <div id="encap-ports"></div>
-        </details>
-        <details class="encap-fold-section encap-input-section">
-          <summary class="encap-section-title">测试</summary>
+        </div>
+        <div id="encap-input-section" role="region" aria-labelledby="encap-preview-test" hidden>
           <div id="encap-inputs" class="encap-inputs"></div>
-        </details>
-        <details class="encap-fold-section encap-reference-section">
-          <summary class="encap-section-title">被引用</summary>
+        </div>
+        <div id="encap-reference-section" role="region" aria-labelledby="encap-preview-references" hidden>
           <div id="encap-references"></div>
-        </details>
+        </div>
         <div id="encap-hint" class="encap-hint"></div>
       </div>
     </div>

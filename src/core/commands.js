@@ -29,7 +29,7 @@ import {
   simplify,
   translateSegment
 } from './wire.js';
-import { route, validateCrossings, buildWireMeta } from './router.js';
+import { route, buildWireMeta } from './router.js';
 import {
   checkPlacement,
   checkComponentPlacement,
@@ -1449,8 +1449,84 @@ export function moveSelectionCommand(state, componentIds, wireIds, dx, dy, frame
     : { ok: true, state: draft, geometryOnly: true };
 }
 
-// 对选中的导线重新自动布线：保持两端锚点（pin / junction / free）与拓扑不变，只重排折线几何。
-// 有其它导线以 junction 锚在本线内部时拒绝，避免整根重布静默拆掉 T 分支。
+function routeHostedGap(state, wireId, prefix, suffix, definitionOptions, validation) {
+  const start = prefix[prefix.length - 1];
+  const goal = suffix[0];
+  // 本线其余部分也占用线路空间，避免新路段与它们重叠或自交。
+  const wires = { ...state.wires };
+  delete wires[wireId];
+  let suffixId = wireId + ':';
+  while (suffixId in wires) suffixId += ':';
+  if (prefix.length > 1) wires[wireId] = { points: prefix };
+  if (suffix.length > 1) wires[suffixId] = { points: suffix };
+
+  const netId = validation.built.netIdOfWire[wireId];
+  const net = validation.built.nets.find(candidate => candidate.id === netId);
+  const options = { ...definitionOptions, ignoreNetOf: [...net.wireIds, suffixId] };
+  const routingState = { ...state, wires };
+  const occupied = new Set(
+    polylinePoints(prefix).slice(0, -1).concat(polylinePoints(suffix).slice(1)).map(pointKeyOf)
+  );
+
+  function validate(gap) {
+    if (polylinePoints(gap).some(point => occupied.has(pointKeyOf(point)))) {
+      return reject(REASONS.ILLEGAL_GEOMETRY);
+    }
+    const points = simplify(prefix.concat(gap.slice(1), suffix.slice(1)));
+    const checked = validateWirePath(state, wireId, points, definitionOptions, validation);
+    return checked.ok ? { ok: true, points: gap } : checked;
+  }
+
+  const forward = routeAndCheckWire(routingState, start, goal, options, validate);
+  if (forward.ok) return forward;
+  return routeAndCheckWire(routingState, goal, start, options, function (gap) {
+    return validate(gap.slice().reverse());
+  });
+}
+
+function autoRouteHostedWire(state, wireId, junctions, definitionOptions) {
+  const wire = state.wires[wireId];
+  const expanded = simpleOrthogonalPoints(wire.points);
+  if (!expanded) return reject(REASONS.ILLEGAL_GEOMETRY);
+  const offsetOf = new Map(expanded.map((point, offset) => [pointKeyOf(point), offset]));
+  const last = expanded.length - 1;
+  const fixed = [[last, last]];
+  // T 点两侧各保留一格直线；本线的 junction 端点也保留接入方向。
+  for (const junction of junctions) {
+    const offset = offsetOf.get(pointKeyOf(junction));
+    if (offset === undefined || offset < WIRE_GRID || offset > last - WIRE_GRID) {
+      return reject(REASONS.ILLEGAL_GEOMETRY);
+    }
+    fixed.push([offset - WIRE_GRID, offset + WIRE_GRID]);
+  }
+  if (wire.endA?.kind === 'junction') fixed.push([0, WIRE_GRID]);
+  if (wire.endB?.kind === 'junction') fixed.push([last - WIRE_GRID, last]);
+  fixed.sort((a, b) => a[0] - b[0]);
+
+  const validation = wireValidation(state, definitionOptions);
+  let points = [expanded[0]];
+  let position = 0;
+  for (const [from, to] of fixed) {
+    if (from > position) {
+      const original = simplify(expanded.slice(position, from + 1));
+      let gap = original;
+      if (original.length > 2) {
+        const suffix = simplify(expanded.slice(from));
+        const routed = routeHostedGap(state, wireId, points, suffix, definitionOptions, validation);
+        if (routed.ok) gap = routed.points;
+      }
+      points = simplify(points.concat(gap.slice(1)));
+      position = from;
+    }
+    if (to > position) {
+      points = simplify(points.concat(expanded.slice(position + 1, to + 1)));
+      position = to;
+    }
+  }
+  return validateWirePath(state, wireId, points, definitionOptions, validation);
+}
+
+// 对选中的导线重新自动布线，保持端点及 T 接点锚定，只重排折线几何。
 // 多选时逐根按 id 排序重布；任一失败整体拒绝，已重布的候选不落盘。
 export function autoRouteWires(state, wireIds, definitionOptions = {}) {
   const ids = Array.isArray(wireIds) ? wireIds.slice() : [];
@@ -1467,20 +1543,31 @@ export function autoRouteWires(state, wireIds, definitionOptions = {}) {
   }
 
   const draft = clone(state);
+  const junctionsByHost = new Map(ordered.map(id => [id, []]));
+  for (const wire of Object.values(draft.wires)) {
+    for (const end of [wire.endA, wire.endB]) {
+      if (end?.kind === 'junction') junctionsByHost.get(end.wireId)?.push(end.point);
+    }
+  }
   const routedIds = [];
   for (const wireId of ordered) {
     const wire = draft.wires[wireId];
     if (!wire || !Array.isArray(wire.points) || wire.points.length < 2) {
       return reject(REASONS.ILLEGAL_GEOMETRY);
     }
-    if (wireHasIncomingJunction(draft, wireId)) {
-      return reject(REASONS.WIRED_OBJECT_LOCKED);
-    }
-
     const start = endPointOf(draft, wire.endA, wire, 'A', { definitions: definitionOptions.definitions });
     const goal = endPointOf(draft, wire.endB, wire, 'B', { definitions: definitionOptions.definitions });
     if (!start || !goal || (start.x === goal.x && start.y === goal.y)) {
       return reject(REASONS.ILLEGAL_GEOMETRY);
+    }
+
+    const junctions = junctionsByHost.get(wireId);
+    if (junctions.length > 0) {
+      const routed = autoRouteHostedWire(draft, wireId, junctions, definitionOptions);
+      if (!routed.ok) return routed;
+      wire.points = routed.points;
+      routedIds.push(wireId);
+      continue;
     }
 
     // 被重布的线本身不能作为障碍；同 net 其它线保留精确接触限制，只放宽 1 格间距。
@@ -1498,13 +1585,12 @@ export function autoRouteWires(state, wireIds, definitionOptions = {}) {
       ignoreNetOf
     }, { definitions: definitionOptions.definitions });
 
+    const validation = wireValidation(draft, definitionOptions);
     let chosen = null;
     let reason = REASONS.NO_ROUTE;
     const forward = route(routingState, start, goal, routeOptions);
     if (forward.ok) {
-      const check = checkMovedWire(draft, wireId, forward.points, {
-        definitions: definitionOptions.definitions
-      });
+      const check = validateWirePath(draft, wireId, forward.points, definitionOptions, validation);
       if (check.ok) {
         chosen = forward.points;
       } else {
@@ -1519,9 +1605,7 @@ export function autoRouteWires(state, wireIds, definitionOptions = {}) {
       const backward = route(routingState, goal, start, routeOptions);
       if (backward.ok) {
         const candidate = backward.points.slice().reverse();
-        const check = checkMovedWire(draft, wireId, candidate, {
-          definitions: definitionOptions.definitions
-        });
+        const check = validateWirePath(draft, wireId, candidate, definitionOptions, validation);
         if (check.ok) {
           chosen = candidate;
         } else {
@@ -1540,14 +1624,9 @@ export function autoRouteWires(state, wireIds, definitionOptions = {}) {
   }
 
   // 多选逐根重布后，后面的线可能改变与前面线的接触关系；对全部已重布线再验一次。
-  for (const wireId of routedIds) {
-    const check = checkMovedWire(draft, wireId, draft.wires[wireId].points, {
-      definitions: definitionOptions.definitions
-    });
-    if (!check.ok) {
-      return reject(check.reason);
-    }
-  }
+  const originals = routedIds.map(id => [id, state.wires[id].points]);
+  const checked = validateWireChanges(draft, originals, definitionOptions);
+  if (!checked.ok) return checked;
 
   return { ok: true, state: draft, wireIds: routedIds, geometryOnly: true };
 }
@@ -2111,6 +2190,7 @@ function checkMovedWire(state, wireId, points, definitionOptions = {}, validatio
   }
 
   const wire = state.wires[wireId];
+  const originalPoints = validation?.originalPoints || wire.points;
   const ends = [
     { end: wire.endA, atStart: true },
     { end: wire.endB, atStart: false }
@@ -2121,7 +2201,7 @@ function checkMovedWire(state, wireId, points, definitionOptions = {}, validatio
       continue;
     }
     const point = endpointPoint(points, item.atStart);
-    if (!samePoint(point, endpointPoint(wire.points, item.atStart))) {
+    if (!samePoint(point, endpointPoint(originalPoints, item.atStart))) {
       if (!movedEndpointValid(state, wireId, end, point, definitionOptions, validation)) {
         return reject(REASONS.ILLEGAL_GEOMETRY);
       }
@@ -2133,8 +2213,145 @@ function checkMovedWire(state, wireId, points, definitionOptions = {}, validatio
   return { ok: true };
 }
 
+function branchesAlongDraggedSegment(state, wireId, a, b, axis, delta) {
+  const branches = [];
+  for (const [id, branch] of Object.entries(state.wires)) {
+    if (id === wireId) continue;
+    let points;
+    for (const [end, index] of [[branch.endA, 0], [branch.endB, branch.points.length - 1]]) {
+      if (end?.kind !== 'junction' || end.wireId !== wireId || !pointOnSegmentInterior(end.point, a, b)) continue;
+      points ??= branch.points.slice();
+      points[index] = { ...end.point, [axis]: end.point[axis] + delta };
+    }
+    if (points) branches.push({ id, points: simplify(points) });
+  }
+  return branches;
+}
+
+function draggedWire(wire, points) {
+  return {
+    ...wire,
+    points,
+    endA: junctionAt(wire.endA, points[0]),
+    endB: junctionAt(wire.endB, points[points.length - 1])
+  };
+}
+
+function junctionAt(end, point) {
+  return end?.kind === 'junction'
+    ? { ...end, point: { x: point.x, y: point.y } }
+    : end;
+}
+
+function validateDraggedWires(state, wires, definitionOptions) {
+  // 同时替换候选后再校验，避免支线的旧折线或旧锚点参与碰撞检查。
+  const candidate = { ...state, wires: { ...state.wires } };
+  for (const { id, points } of wires) {
+    if (points.length < 2) return reject(REASONS.ILLEGAL_GEOMETRY);
+    candidate.wires[id] = draggedWire(state.wires[id], points);
+  }
+  const originals = wires.map(({ id }) => [id, state.wires[id].points]);
+  return validateWireChanges(candidate, originals, definitionOptions);
+}
+
+function validateWireChanges(candidate, originals, definitionOptions, validation = wireValidation(candidate, definitionOptions)) {
+  for (const [id, originalPoints] of originals) {
+    const check = checkMovedWire(candidate, id, candidate.wires[id].points, definitionOptions, {
+      ...validation,
+      requireDeclaredContacts: true,
+      originalPoints
+    });
+    if (!check.ok) return check;
+  }
+  return { ok: true };
+}
+
+// 单根线试布不同路径时，拓扑和其余导线不变，可以复用碰撞索引。
+function validateWirePath(state, wireId, points, definitionOptions, validation, originalPoints = state.wires[wireId].points) {
+  const wire = { ...state.wires[wireId], points };
+  const candidate = { ...state, wires: { ...state.wires, [wireId]: wire } };
+  const checked = validateWireChanges(candidate, [[wireId, originalPoints]], definitionOptions, validation);
+  return checked.ok ? { ok: true, points } : checked;
+}
+
+// 同一根宿主上，只有 T 点所在末段的 free 端可以和该 T 点合并。
+function freeEndOfJunctionSegment(state, end, point) {
+  if (end.kind !== 'junction' || !isWireGridPoint(end.point)) return null;
+  for (const side of ['A', 'B']) {
+    const target = freeSideInfo(state, end.wireId, side);
+    if (!target || !samePoint(target.point, point)) continue;
+    const points = target.wire.points;
+    const adjacent = side === 'A' ? points[1] : points[points.length - 2];
+    if (pointOnSegmentInterior(end.point, target.point, adjacent)) return side;
+  }
+  return null;
+}
+
+// 在候选图中拼接已重合的两端，保留 wireId 和原方向。
+function joinWireCorner(draft, wireId, side, otherId, otherSide) {
+  const wire = draft.wires[wireId];
+  const other = draft.wires[otherId];
+  if (wireId === otherId || wire.points.length < 2 || other.points.length < 2) return false;
+  const atStart = side === 'A';
+  const otherAtStart = otherSide === 'A';
+  const corner = endpointPoint(wire.points, atStart);
+  const outgoing = endpointPoint(other.points, otherAtStart);
+  const near = atStart ? wire.points[1] : wire.points[wire.points.length - 2];
+  const otherNear = otherAtStart ? other.points[1] : other.points[other.points.length - 2];
+  const axis = segmentDragAxis([corner, near], 0);
+  const otherAxis = segmentDragAxis([outgoing, otherNear], 0);
+  if (!samePoint(corner, outgoing) || !axis || !otherAxis || axis === otherAxis) return false;
+
+  const remainingEnd = wireEnd(other, otherAtStart ? 'B' : 'A');
+  if (!remainingEnd || (remainingEnd.kind === 'junction' && remainingEnd.wireId === wireId)) return false;
+  const otherPoints = atStart === otherAtStart ? other.points.slice().reverse() : other.points;
+  wire[atStart ? 'endA' : 'endB'] = remainingEnd;
+  wire.points = atStart
+    ? otherPoints.slice(0, -1).concat(wire.points)
+    : wire.points.concat(otherPoints.slice(1));
+  delete draft.wires[otherId];
+
+  for (const candidate of Object.values(draft.wires)) {
+    for (const end of [candidate.endA, candidate.endB]) {
+      if (end?.kind === 'junction' && end.wireId === otherId) end.wireId = wireId;
+    }
+  }
+  return true;
+}
+
+function collapseJunctionsAfterSegmentDrag(state, wireId, moved, branches, definitionOptions) {
+  const wire = state.wires[wireId];
+  const originalEnds = [wire.points[0], wire.points[wire.points.length - 1]];
+  const collapses = [];
+  for (const side of ['A', 'B']) {
+    const end = wireEnd(wire, side);
+    const point = endpointPoint(moved.points, side === 'A');
+    const hostSide = end && freeEndOfJunctionSegment(state, end, point);
+    if (hostSide) collapses.push({ side, hostId: end.wireId, hostSide });
+  }
+  if (!collapses.length) return null;
+
+  const draft = clone(state);
+  for (const { id, points } of [{ id: wireId, points: moved.points }, ...branches]) {
+    if (points.length < 2) return reject(REASONS.ILLEGAL_GEOMETRY);
+    draft.wires[id] = draggedWire(draft.wires[id], points);
+  }
+  for (const { side, hostId, hostSide } of collapses) {
+    const host = draft.wires[hostId];
+    if (!host || !joinWireCorner(draft, wireId, side, hostId, hostSide)) return reject(REASONS.ILLEGAL_GEOMETRY);
+    originalEnds[side === 'A' ? 0 : 1] = endpointPoint(host.points, hostSide === 'B');
+  }
+  const originals = [[wireId, originalEnds], ...branches.map(({ id }) => [id, state.wires[id].points])];
+  const check = validateWireChanges(draft, originals, definitionOptions);
+  if (!check.ok) return check;
+  return {
+    ok: true, state: draft, points: draft.wires[wireId].points, delta: moved.delta, branches,
+    collapsedWireIds: collapses.map(({ hostId }) => hostId)
+  };
+}
+
 // 预览：返回候选折线（失败时也尽量带回，便于 UI 画红色虚线）。
-export function previewDragWireSegment(state, wireId, segmentIndex, offset, definitionOptions = {}) {
+function planDragWireSegment(state, wireId, segmentIndex, offset, definitionOptions) {
   const wire = state.wires[wireId];
   if (!wire || !Array.isArray(wire.points)) {
     return reject(REASONS.ILLEGAL_GEOMETRY);
@@ -2185,31 +2402,46 @@ export function previewDragWireSegment(state, wireId, segmentIndex, offset, defi
     return { ok: true, points: moved.points, delta: 0 };
   }
 
-  const check = checkMovedWire(state, wireId, moved.points, { definitions: definitionOptions.definitions });
+  const branches = branchesAlongDraggedSegment(
+    state, wireId, original[segmentIndex], original[segmentIndex + 1], axis, moved.delta
+  );
+  const collapse = collapseJunctionsAfterSegmentDrag(state, wireId, moved, branches, definitionOptions);
+  if (collapse) return collapse.ok ? collapse : { ...collapse, points: moved.points, delta: moved.delta, branches };
+
+  const candidates = [{ id: wireId, points: moved.points }, ...branches];
+  const check = validateDraggedWires(state, candidates, definitionOptions);
+  if (branches.length) {
+    return { ...check, points: moved.points, delta: moved.delta, branches };
+  }
+
   if (!check.ok) {
     return { ok: false, reason: check.reason, points: moved.points };
   }
   return { ok: true, points: moved.points, delta: moved.delta };
 }
 
+export function previewDragWireSegment(state, wireId, segmentIndex, offset, definitionOptions = {}) {
+  return wirePlanPreview(planDragWireSegment(state, wireId, segmentIndex, offset, definitionOptions));
+}
+
 // 提交：成功才替换线段折线；失败零副作用。
 export function dragWireSegment(state, wireId, segmentIndex, offset, definitionOptions = {}) {
-  const preview = previewDragWireSegment(state, wireId, segmentIndex, offset, { definitions: definitionOptions.definitions });
+  const preview = planDragWireSegment(state, wireId, segmentIndex, offset, definitionOptions);
   if (!preview.ok) {
     return reject(preview.reason);
   }
-  const draft = clone(state);
-  const wire = draft.wires[wireId];
-  wire.points = JSON.parse(JSON.stringify(preview.points));
-  updateJunctionPoint(wire.endA, wire.points[0]);
-  updateJunctionPoint(wire.endB, wire.points[wire.points.length - 1]);
-  return { ok: true, state: draft, delta: preview.delta, geometryOnly: true };
-}
-
-function updateJunctionPoint(end, point) {
-  if (end && end.kind === 'junction') {
-    end.point = { x: point.x, y: point.y };
+  if (preview.state) {
+    return {
+      ok: true, state: preview.state, id: wireId, points: preview.points, delta: preview.delta,
+      branches: preview.branches, collapsedWireIds: preview.collapsedWireIds
+    };
   }
+  const draft = clone(state);
+  draft.wires[wireId] = draggedWire(draft.wires[wireId], preview.points);
+  for (const { id, points } of preview.branches || []) {
+    draft.wires[id] = draggedWire(draft.wires[id], points);
+  }
+  return { ok: true, state: draft, delta: preview.delta, geometryOnly: true };
 }
 
 // ── 悬空端点接空闲引脚 ──────────────────────────────────────────────────────
@@ -2217,6 +2449,82 @@ function updateJunctionPoint(end, point) {
 
 function wireEnd(wire, side) {
   return side === 'A' ? wire.endA : wire.endB;
+}
+
+function wirePlanPreview(plan) {
+  const { state: _draft, collapsedWireIds: _collapsedWireIds, ...preview } = plan;
+  return preview;
+}
+
+function planWireCorner(state, wireId, side, otherId, otherSide, points, definitionOptions) {
+  const draft = clone(state);
+  draft.wires[wireId] = draggedWire(draft.wires[wireId], clone(points));
+  if (!joinWireCorner(draft, wireId, side, otherId, otherSide)) return reject(REASONS.ILLEGAL_GEOMETRY);
+  const joined = draft.wires[wireId].points;
+  const checked = validateWireChanges(draft, [[wireId, joined]], definitionOptions);
+  return checked.ok
+    ? { ok: true, state: draft, id: wireId, removedId: otherId, points: joined, collapsedWireIds: [otherId] }
+    : checked;
+}
+
+function planCollapseMovedFreeEnd(state, wireId, side, point, definitionOptions) {
+  const source = freeSideInfo(state, wireId, side);
+  if (!source || !isWireGridPoint(point)) return null;
+  const points = source.wire.points;
+  const atStart = side === 'A';
+  const adjacent = atStart ? points[1] : points[points.length - 2];
+  if (!pointOnSegmentInterior(point, source.point, adjacent)) return null;
+  for (const [branchId, branch] of Object.entries(state.wires)) {
+    if (branchId === wireId) continue;
+    for (const branchSide of ['A', 'B']) {
+      const end = wireEnd(branch, branchSide);
+      if (end?.kind !== 'junction' || end.wireId !== wireId || !samePoint(end.point, point)) continue;
+      const shortened = atStart ? [point, ...points.slice(1)] : [...points.slice(0, -1), point];
+      return planWireCorner(state, wireId, side, branchId, branchSide, shortened, definitionOptions);
+    }
+  }
+  return null;
+}
+
+function planCollapseMovedJunction(state, wireId, side, point, definitionOptions) {
+  const wire = state.wires[wireId];
+  if (!wire || !Array.isArray(wire.points) || (side !== 'A' && side !== 'B') || !isWireGridPoint(point)) return null;
+  const end = wireEnd(wire, side);
+  const hostSide = end && freeEndOfJunctionSegment(state, end, point);
+  if (!hostSide) return null;
+  const atStart = side === 'A';
+  const points = wire.points;
+  const segment = atStart ? 0 : points.length - 2;
+  const axis = segmentDragAxis(points, segment);
+  if (!axis) return reject(REASONS.ILLEGAL_GEOMETRY);
+  const validate = candidate => planWireCorner(state, wireId, side, end.wireId, hostSide, candidate, definitionOptions);
+  const shifted = translateSegment(points, segment, point[axis] - end.point[axis], {
+    fixStart: !atStart,
+    fixEnd: atStart
+  });
+  if (shifted) {
+    const checked = validate(shifted.points);
+    if (checked.ok) return checked;
+  }
+
+  // 仅移动接点时，给原支线留一格垂直出线，优先沿用远端及既有支线路径。
+  const ordered = atStart ? points : points.slice().reverse();
+  const direction = segmentDirection(ordered[0], ordered[1]);
+  const step = vertex => ({ x: vertex.x + direction.x * WIRE_GRID, y: vertex.y + direction.y * WIRE_GRID });
+  const approach = step(point);
+  const orient = candidate => atStart ? candidate : candidate.slice().reverse();
+  const jog = validate(orient(simplify([point, approach, step(ordered[0]), ...ordered.slice(1)])));
+  if (jog.ok) return jog;
+
+  const ignoreNetOf = collectNetWireIds(state, [end], definitionOptions);
+  const finishRoute = candidate => validate(orient(simplify([point, ...candidate.slice().reverse()])));
+  if (wireHasIncomingJunction(state, wireId)) {
+    return routeHostedWireEnd(state, wireId, side, approach, ignoreNetOf, definitionOptions, finishRoute);
+  }
+  const routingState = { ...state, wires: { ...state.wires } };
+  delete routingState.wires[wireId];
+  return routeAndCheckWire(routingState, ordered[ordered.length - 1], approach,
+    { ...definitionOptions, ignoreNetOf }, finishRoute);
 }
 
 function wireHasIncomingJunction(state, wireId) {
@@ -2294,11 +2602,6 @@ function routeHostedWireEnd(state, wireId, side, targetPoint, ignoreNetOf, defin
   });
 }
 
-function validateHostedWire(state, wireId, points, definitionOptions, validation) {
-  const checked = checkMovedWire(state, wireId, points, definitionOptions, validation);
-  return checked.ok ? { ok: true, points } : checked;
-}
-
 function pinEndFromAnchor(state, anchor, definitionOptions = {}) {
   if (!anchor || anchor.kind !== 'pin') {
     return null;
@@ -2318,9 +2621,9 @@ function pinEndFromAnchor(state, anchor, definitionOptions = {}) {
   }
 }
 
-// 统一的 free 端点移动计划：targetEnd 为 pin/junction 时接线，为 null 时移动到空白点。
+// 统一的端点移动计划：targetEnd 为 pin/junction 时接线，为 null 时移动到空白点。
 // 含 T 点时只重布拖动端一侧，自有 T 点仍保留在直线内部。
-function planWireEndMove(state, wireId, side, targetPoint, targetEnd, definitionOptions = {}, options = {}) {
+function planWireEndMove(state, wireId, side, targetPoint, targetEnd, definitionOptions = {}, sourceKind = 'free') {
   if (side !== 'A' && side !== 'B') {
     return reject(REASONS.ILLEGAL_GEOMETRY);
   }
@@ -2329,15 +2632,15 @@ function planWireEndMove(state, wireId, side, targetPoint, targetEnd, definition
     return reject(REASONS.ILLEGAL_GEOMETRY);
   }
   const end = wireEnd(wire, side);
-  const allowPinnedSource = Boolean(options && options.allowPinnedSource);
-  if (!end || (end.kind !== 'free' && !(allowPinnedSource && end.kind === 'pin'))) {
+  if (end?.kind !== sourceKind) {
     return reject(REASONS.ILLEGAL_GEOMETRY);
   }
   if (!isWireGridPoint(targetPoint)) {
     return reject(REASONS.ILLEGAL_GEOMETRY);
   }
+  const endKey = side === 'A' ? 'endA' : 'endB';
   const hasBranches = wireHasIncomingJunction(state, wireId);
-  if (hasBranches && (end.kind !== 'free' || targetEnd?.kind === 'junction')) {
+  if (hasBranches && end.kind === 'pin') {
     return reject(REASONS.WIRED_OBJECT_LOCKED);
   }
 
@@ -2345,10 +2648,15 @@ function planWireEndMove(state, wireId, side, targetPoint, targetEnd, definition
   if (targetEnd && targetEnd.kind === 'junction') {
     const host = junctionHost(state, targetEnd);
     if (targetEnd.wireId === wireId || !host.ok ||
+        (end.kind === 'junction' && targetEnd.wireId === end.wireId) ||
         !movedEndpointValid(state, wireId, targetEnd, targetPoint, definitionOptions)) {
       return reject(REASONS.ILLEGAL_GEOMETRY);
     }
-    const current = buildNets(state, definitionOptions);
+    // 换接时先去掉旧 T 路径。目标在原 net 内，只有此时仍与支线相连才成环。
+    const disconnected = end.kind === 'junction'
+      ? { ...state, wires: { ...state.wires, [wireId]: { ...wire, [endKey]: { kind: 'free' } } } }
+      : state;
+    const current = buildNets(disconnected, definitionOptions);
     if (current.netIdOfWire[wireId] === current.netIdOfWire[targetEnd.wireId]) {
       return reject(REASONS.PURE_WIRE_LOOP);
     }
@@ -2363,7 +2671,7 @@ function planWireEndMove(state, wireId, side, targetPoint, targetEnd, definition
     }
     const currentPoint = side === 'A' ? wire.points[0] : wire.points[wire.points.length - 1];
     if (samePoint(currentPoint, targetPoint)) {
-      // free 端点原地释放是幂等操作；pin 端点原地释放会得到“压在引脚上的悬空端”，拒绝。
+      // free 端点原地释放是幂等操作；已接端点仍需移开才可悬空。
       if (end.kind !== 'free') {
         return reject(REASONS.ILLEGAL_GEOMETRY);
       }
@@ -2375,17 +2683,16 @@ function planWireEndMove(state, wireId, side, targetPoint, targetEnd, definition
 
   // 拓扑预检（多驱动 / 反馈环），避免为必然失败的连接跑布线。
   const topologyDraft = clone(state);
-  if (side === 'A') {
-    topologyDraft.wires[wireId].endA = clone(nextEnd);
-  } else {
-    topologyDraft.wires[wireId].endB = clone(nextEnd);
-  }
+  topologyDraft.wires[wireId][endKey] = clone(nextEnd);
   const built = buildNets(topologyDraft, { definitions: definitionOptions.definitions });
   const net = built.nets.find(function (candidate) {
     return candidate.wireIds.indexOf(wireId) !== -1;
   });
   if (net && net.driverPins.length >= 2) {
     return reject(REASONS.SECOND_DRIVER);
+  }
+  if (end.kind === 'junction' && !movedEndpointValid(topologyDraft, wireId, nextEnd, targetPoint, definitionOptions)) {
+    return reject(REASONS.ILLEGAL_GEOMETRY);
   }
 
   const otherSide = side === 'A' ? 'B' : 'A';
@@ -2399,19 +2706,16 @@ function planWireEndMove(state, wireId, side, targetPoint, targetEnd, definition
   }
 
   if (hasBranches) {
-    const validation = { ...wireValidation(topologyDraft, definitionOptions), requireDeclaredContacts: true };
-    const selected = routeHostedWireEnd(state, wireId, side, targetPoint, net?.wireIds || [], definitionOptions, function (ordered) {
+    const validation = wireValidation(topologyDraft, definitionOptions);
+    return routeHostedWireEnd(state, wireId, side, targetPoint, net?.wireIds || [], definitionOptions, function (ordered) {
       const points = side === 'A' ? ordered.slice().reverse() : ordered;
-      return validateHostedWire(topologyDraft, wireId, points, definitionOptions, validation);
+      return validateWirePath(topologyDraft, wireId, points, definitionOptions, validation);
     });
-    if (!selected.ok) return selected;
-    topologyDraft.wires[wireId].points = selected.points;
-    return junctionsValid(topologyDraft) && wireCellsValid(topologyDraft, definitionOptions, validation.bounds)
-      ? selected
-      : reject(REASONS.ILLEGAL_GEOMETRY);
   }
 
-  const ignoreNetOf = collectNetWireIds(state, [otherEnd, targetEnd], { definitions: definitionOptions.definitions });
+  const ignoreNetOf = end.kind === 'junction'
+    ? (net?.wireIds || [])
+    : collectNetWireIds(state, [otherEnd, targetEnd], { definitions: definitionOptions.definitions });
   const routingState = {
     nextId: state.nextId,
     components: state.components,
@@ -2427,44 +2731,9 @@ function planWireEndMove(state, wireId, side, targetPoint, targetEnd, definition
     return reject(routed.reason);
   }
 
-  if (targetEnd && targetEnd.kind === 'junction' &&
-      !isPerpendicularToHost(routed.points, false, junctionHost(state, targetEnd).host)) {
-    return reject(REASONS.ILLEGAL_GEOMETRY);
-  }
-
-  if (otherEnd && otherEnd.kind === 'junction') {
-    const host = state.wires[otherEnd.wireId];
-    if (!host) {
-      return reject(REASONS.ILLEGAL_GEOMETRY);
-    }
-    const hit = pointOnPolylineInterior(host.points, otherEnd.point);
-    if (!hit.on) {
-      return reject(REASONS.ILLEGAL_GEOMETRY);
-    }
-    // route 从固定的另一端起步，因此检查起点侧。
-    if (!isPerpendicularToHost(routed.points, true, { points: host.points, index: hit.index })) {
-      return reject(REASONS.ILLEGAL_GEOMETRY);
-    }
-  }
-
   // route 总是从固定端出发到目标点；折线顺序必须与 endA→endB 一致。
   const points = side === 'A' ? routed.points.slice().reverse() : routed.points;
-
-  const draft = topologyDraft;
-  const draftWire = draft.wires[wireId];
-  draftWire.points = points;
-
-  if (!junctionsValid(draft) || !wireCellsValid(draft, { definitions: definitionOptions.definitions })) {
-    return reject(REASONS.ILLEGAL_GEOMETRY);
-  }
-  const others = Object.assign({}, draft.wires);
-  delete others[wireId];
-  const temp = { nextId: draft.nextId, components: draft.components, wires: others };
-  if (!validateCrossings(temp, draftWire.points)) {
-    return reject(REASONS.ILLEGAL_GEOMETRY);
-  }
-
-  return { ok: true, points };
+  return validateWirePath(topologyDraft, wireId, points, definitionOptions);
 }
 
 export function previewAttachFreeEnd(state, wireId, side, anchor, definitionOptions = {}) {
@@ -2497,15 +2766,18 @@ export function attachFreeEnd(state, wireId, side, anchor, definitionOptions = {
   return { ok: true, state: draft };
 }
 
+function planMoveFreeEnd(state, wireId, side, point, definitionOptions) {
+  return planCollapseMovedFreeEnd(state, wireId, side, point, definitionOptions) ??
+    planWireEndMove(state, wireId, side, point, null, definitionOptions);
+}
+
 export function previewMoveFreeEnd(state, wireId, side, point, definitionOptions = {}) {
-  return planWireEndMove(state, wireId, side, point, null, { definitions: definitionOptions.definitions });
+  return wirePlanPreview(planMoveFreeEnd(state, wireId, side, point, definitionOptions));
 }
 
 export function moveFreeEnd(state, wireId, side, point, definitionOptions = {}) {
-  const preview = previewMoveFreeEnd(state, wireId, side, point, { definitions: definitionOptions.definitions });
-  if (!preview.ok) {
-    return reject(preview.reason);
-  }
+  const preview = planMoveFreeEnd(state, wireId, side, point, definitionOptions);
+  if (!preview.ok || preview.state) return preview;
   const draft = applyWireEndPlan(state, wireId, preview.points);
   return { ok: true, state: draft, geometryOnly: true };
 }
@@ -2515,14 +2787,9 @@ export function moveFreeEnd(state, wireId, side, point, definitionOptions = {}) 
 // 目标为另一个空闲 pin 时直接重接过去。目标/几何失败时零副作用。
 
 export function previewDetachPinEnd(state, wireId, side, point, targetEnd, definitionOptions = {}) {
-  const wire = state.wires[wireId];
-  const end = wire && (side === 'A' ? wire.endA : wire.endB);
-  if (!end || end.kind !== 'pin') {
-    return reject(REASONS.ILLEGAL_GEOMETRY);
-  }
   return planWireEndMove(state, wireId, side, point, targetEnd || null, {
     definitions: definitionOptions.definitions
-  }, { allowPinnedSource: true });
+  }, 'pin');
 }
 
 export function detachPinEnd(state, wireId, side, point, targetEnd, definitionOptions = {}) {
@@ -2533,6 +2800,35 @@ export function detachPinEnd(state, wireId, side, point, targetEnd, definitionOp
     return reject(preview.reason);
   }
   const nextEnd = targetEnd || { kind: 'free' };
+  const draft = applyWireEndPlan(state, wireId, preview.points, side, nextEnd);
+  return { ok: true, state: draft, id: wireId, points: preview.points };
+}
+
+function planDetachJunctionEnd(state, wireId, side, point, definitionOptions) {
+  return planCollapseMovedJunction(state, wireId, side, point, definitionOptions) ??
+    planWireEndMove(state, wireId, side, point, null, definitionOptions, 'junction');
+}
+
+export function previewDetachJunctionEnd(state, wireId, side, point, definitionOptions = {}) {
+  return wirePlanPreview(planDetachJunctionEnd(state, wireId, side, point, definitionOptions));
+}
+
+export function detachJunctionEnd(state, wireId, side, point, definitionOptions = {}) {
+  const preview = planDetachJunctionEnd(state, wireId, side, point, definitionOptions);
+  if (!preview.ok || preview.state) return preview;
+  const draft = applyWireEndPlan(state, wireId, preview.points, side, { kind: 'free' });
+  return { ok: true, state: draft, id: wireId, points: preview.points };
+}
+
+export function previewReconnectJunctionEnd(state, wireId, side, anchor, definitionOptions = {}) {
+  if (anchor?.kind !== 'junction') return reject(REASONS.ILLEGAL_GEOMETRY);
+  return planWireEndMove(state, wireId, side, anchor.point, anchor, definitionOptions, 'junction');
+}
+
+export function reconnectJunctionEnd(state, wireId, side, anchor, definitionOptions = {}) {
+  const preview = previewReconnectJunctionEnd(state, wireId, side, anchor, definitionOptions);
+  if (!preview.ok) return preview;
+  const nextEnd = { kind: 'junction', wireId: anchor.wireId, point: anchor.point };
   const draft = applyWireEndPlan(state, wireId, preview.points, side, nextEnd);
   return { ok: true, state: draft, id: wireId, points: preview.points };
 }
@@ -2641,6 +2937,9 @@ function planAnchoredFreeWire(state, anchor, point, definitionOptions = {}) {
   if (!topology.ok) {
     return reject(topology.reason);
   }
+  if (anchor.kind === 'junction' && touchesForeignWire(state, startPoint, anchor.wireId)) {
+    return reject(REASONS.ILLEGAL_GEOMETRY);
+  }
 
   // 临时把新线挂到拓扑上，让 free 端点与“本线所属 net”比较净距；
   // 若直接用不存在的 wireId，junction 起点会把宿主当成外来导线而误拒。
@@ -2728,6 +3027,52 @@ function freeSideInfo(state, wireId, side) {
   };
 }
 
+// 空白处画线接到 free 端时，只追加新路径。原导线及其 T 接点不重布。
+function planExtendFreeWire(state, wireId, side, point, definitionOptions) {
+  const target = freeSideInfo(state, wireId, side);
+  if (!target || !isWireGridPoint(point) || samePoint(point, target.point)) {
+    return reject(REASONS.ILLEGAL_GEOMETRY);
+  }
+  const validation = { ...wireValidation(state, definitionOptions), requireDeclaredContacts: true };
+  const entriesAt = vertex => validation.meta.get(pointKeyOf(vertex));
+  if (
+    entriesAt(point)?.some(entry => entry.wireId === wireId) ||
+    entriesAt(target.point)?.some(entry => entry.wireId !== wireId) ||
+    !movedEndpointValid(state, wireId, target.end, point, definitionOptions, validation)
+  ) {
+    return reject(REASONS.ILLEGAL_GEOMETRY);
+  }
+  const netId = validation.built.netIdOfWire[wireId];
+  const net = validation.built.nets.find(candidate => candidate.id === netId);
+  const routeOptions = { definitions: definitionOptions.definitions, ignoreNetOf: net?.wireIds || [] };
+  return routeAndCheckWire(state, point, target.point, routeOptions, function (extension) {
+    // 先排除折返和自交，避免 simplify 抹掉原导线的一部分。
+    const expanded = polylinePoints(extension);
+    if (expanded.slice(0, -1).some(vertex => entriesAt(vertex)?.some(entry => entry.wireId === wireId))) {
+      return reject(REASONS.ILLEGAL_GEOMETRY);
+    }
+    const original = target.wire.points;
+    const joined = side === 'A'
+      ? extension.concat(original.slice(1))
+      : original.concat(extension.slice(0, -1).reverse());
+    const fullPoints = simplify(joined);
+    const checked = checkMovedWire(state, wireId, fullPoints, definitionOptions, validation);
+    return checked.ok ? { ok: true, points: extension, fullPoints } : checked;
+  });
+}
+
+export function previewExtendFreeWire(state, wireId, side, point, definitionOptions = {}) {
+  const plan = planExtendFreeWire(state, wireId, side, point, definitionOptions);
+  return plan.ok ? { ok: true, points: plan.points } : plan;
+}
+
+export function extendFreeWire(state, wireId, side, point, definitionOptions = {}) {
+  const plan = planExtendFreeWire(state, wireId, side, point, definitionOptions);
+  if (!plan.ok) return plan;
+  const draft = applyWireEndPlan(state, wireId, plan.fullPoints);
+  return { ok: true, state: draft, id: wireId, points: plan.points, geometryOnly: true };
+}
+
 function planMergeFreeEnds(state, wireId, side, targetWireId, targetSide, definitionOptions = {}) {
   const defs = { definitions: definitionOptions.definitions };
   if (!wireId || !targetWireId || wireId === targetWireId) {
@@ -2782,22 +3127,21 @@ function planMergeFreeEnds(state, wireId, side, targetWireId, targetSide, defini
     ? target.wire.points.slice().reverse()
     : target.wire.points;
   const suffix = targetPoints.slice(1);
-  const validation = hasBranches ? { ...wireValidation(draft, defs), requireDeclaredContacts: true } : null;
+  const validation = wireValidation(draft, defs);
   const ignoreNetOf = hasBranches && mergedNet
     ? mergedNet.wireIds.concat(targetWireId)
     : collectNetWireIds(state, [sourceOtherEnd], defs);
-  const join = function (prefix) {
-    return simplify(prefix.concat(suffix));
-  };
-  const expandedTarget = hasBranches ? simpleOrthogonalPoints(targetPoints) : null;
-  if (hasBranches && !expandedTarget) return reject(REASONS.ILLEGAL_GEOMETRY);
-  const targetFootprint = expandedTarget && new Set(expandedTarget.slice(1).map(pointKeyOf));
+  const expandedTarget = simpleOrthogonalPoints(targetPoints);
+  if (!expandedTarget) return reject(REASONS.ILLEGAL_GEOMETRY);
+  const targetFootprint = new Set(expandedTarget.slice(1).map(pointKeyOf));
+  const originalEnds = [sourceOtherPoint, targetOtherPoint];
   const validateJoin = function (prefix) {
     // 两段只能在 free 合并点相接。先检验再简化，避免共线折返被消掉。
     if (polylinePoints(prefix).some(point => targetFootprint.has(pointKeyOf(point)))) {
       return reject(REASONS.ILLEGAL_GEOMETRY);
     }
-    return validateHostedWire(draft, wireId, join(prefix), defs, validation);
+    const points = simplify(prefix.concat(suffix));
+    return validateWirePath(draft, wireId, points, defs, validation, originalEnds);
   };
 
   let selected;
@@ -2807,29 +3151,16 @@ function planMergeFreeEnds(state, wireId, side, targetWireId, targetSide, defini
     const routingState = { ...state, wires: { ...state.wires } };
     delete routingState.wires[wireId];
     const routeOptions = { ...defs, allowTouching: [sourceOtherPoint, target.point], ignoreNetOf };
-    selected = hasBranches
-      ? routeAndCheckWire(routingState, sourceOtherPoint, target.point, routeOptions, validateJoin)
-      : route(routingState, sourceOtherPoint, target.point, routeOptions);
+    if (hasBranches) {
+      selected = routeAndCheckWire(routingState, sourceOtherPoint, target.point, routeOptions, validateJoin);
+    } else {
+      const routed = route(routingState, sourceOtherPoint, target.point, routeOptions);
+      selected = routed.ok ? validateJoin(routed.points) : routed;
+    }
   }
   if (!selected.ok) return reject(selected.reason);
-  const points = hasBranches ? selected.points : join(selected.points);
-
-  const expanded = simpleOrthogonalPoints(points);
-  if (!expanded) return reject(REASONS.ILLEGAL_GEOMETRY);
-  if (!hasBranches && polylineOverlapsComponentEdge(points, Object.values(draft.components), defs)) {
-    return reject(REASONS.WIRE_ON_COMPONENT_EDGE);
-  }
+  const points = selected.points;
   draft.wires[wireId].points = clone(points);
-  if (
-    !junctionsValid(draft) ||
-    !wireCellsValid(draft, defs, validation?.bounds) ||
-    (!hasBranches && !endpointsPreserved(draft, wireId, points, defs))
-  ) {
-    return reject(REASONS.ILLEGAL_GEOMETRY);
-  }
-  if (!hasBranches && !foreignContactsValid(draft, wireId, expanded, defs)) {
-    return reject(REASONS.ILLEGAL_GEOMETRY);
-  }
 
   return {
     ok: true,

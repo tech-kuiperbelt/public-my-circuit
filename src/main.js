@@ -1,7 +1,7 @@
 import { createController } from "./ui/encapsulation-controller.js";
 import { createPreview } from "./ui/encapsulation-preview.js";
 import { createPanel } from "./ui/encapsulation-panel.js";
-import { cloneValue, rootDraftOf, evaluateDraft, resolvePortNet, portNetId, freeSlotFor, normalizeDraftPorts, draftHasChanges } from "./ui/encapsulation-model.js";
+import { cloneValue, rootDraftOf, draftRuntimeOptions, draftTestValues, invalidateDraftRuntime, evaluateDraft, resolvePortNet, portNetId, freeSlotFor, normalizeDraftPorts, draftHasChanges } from "./ui/encapsulation-model.js";
 // 入口：持有 state/view/selection，装配元件栏、工具栏、菜单、toast 与输入。
 import { CLOCK_MAX_PERIOD, CLOCK_MIN_PERIOD } from './core/entities.js';
 import { createState } from './core/state.js';
@@ -93,9 +93,12 @@ const encapPorts = document.getElementById('encap-ports');
 const encapInputs = document.getElementById('encap-inputs');
 const encapReferences = document.getElementById('encap-references');
 const encapPreview = document.getElementById('encap-preview');
-const encapPortSection = document.querySelector('.encap-port-section');
-const encapInputSection = document.querySelector('.encap-input-section');
-const encapReferenceSection = document.querySelector('.encap-reference-section');
+const encapPortSection = document.getElementById('encap-port-section');
+const encapPreviewTabs = [
+  ['layout', document.getElementById('encap-preview-layout'), encapPortSection],
+  ['test', document.getElementById('encap-preview-test'), document.getElementById('encap-input-section')],
+  ['references', document.getElementById('encap-preview-references'), document.getElementById('encap-reference-section')]
+];
 
 const toast = createToast(toastElement);
 const menu = createMenu(menuElement);
@@ -411,7 +414,7 @@ const app = {
     if (!(draft.ports || []).some(function (port) { return port.id === portId; })) {
       return false;
     }
-    removeDraftPort(portId);
+    if (!removeDraftPort(portId)) return false;
     if (this.selection.kind === 'port') {
       this.setSelection({ kind: null, id: null });
     }
@@ -508,9 +511,7 @@ const app = {
     if (this.isReadOnlyDraft() && mode !== 'select') {
       mode = 'select';
     }
-    const leavingCopy = this.mode === 'copy' && mode !== 'copy';
-    const redrawCopy = leavingCopy && Boolean(this.overlay.copyGhost);
-    if (leavingCopy) input?.cancelWire();
+    const redrawCopy = input?.cancelCopyForModeChange(mode);
     this.mode = mode;
     if (mode === 'select' || mode === 'annotate' || mode === 'erase-port') {
       this.placeType = null;
@@ -601,9 +602,25 @@ const app = {
     if (!this.draft && session && !session.canEdit()) {
       return false;
     }
-    const committed = commitResult(result, this.evaluation, undefined, {
-      definitions: this.getDefinitions()
-    });
+    let evaluationOptions = { definitions: this.getDefinitions() };
+    let updatedPorts;
+    if (this.draft && result?.collapsedWireIds?.length) {
+      updatedPorts = this.draft.ports.map(port => {
+        const binding = port.binding;
+        return binding?.kind === 'wire' && result.collapsedWireIds.includes(binding.wireId)
+          ? { ...port, binding: { ...binding, wireId: result.id } }
+          : port;
+      });
+    }
+    if (this.draft && result?.ok && result.state && !(result.geometryOnly && this.evaluation?.status)) {
+      if (result.state === this.draft.state) invalidateDraftRuntime(result.state);
+      evaluationOptions = draftRuntimeOptions({
+        ...this.draft,
+        state: result.state,
+        ports: updatedPorts || this.draft.ports
+      });
+    }
+    const committed = commitResult(result, this.evaluation, undefined, evaluationOptions);
     if (!committed.ok) {
       if (committed.reason) {
         toast.show(committed.reason);
@@ -620,10 +637,11 @@ const app = {
     this.state = committed.state;
     this.evaluation = committed.evaluation;
     if (this.draft) {
+      if (updatedPorts) this.draft.ports = updatedPorts;
       this.draft.state = committed.state;
       this.draft.evaluation = committed.evaluation;
-      // 编辑内部电路后同步测试区 OUT 值，无需等待下一次面板刷新。
       renderDraftTestPins();
+      if (preview.getMode() === 'test') renderDraftPreview();
     }
     if (this.overlay.hoverPin) {
       this.setHoverPin(this.overlay.hoverPin, null);
@@ -654,7 +672,6 @@ const panel = createPanel({
   encapEdit,
   encapHint,
   encapIconTrigger,
-  encapInputSection,
   encapInputs,
   encapKind,
   encapMainBlocker,
@@ -663,8 +680,8 @@ const panel = createPanel({
   encapPanel,
   encapPortSection,
   encapPorts,
+  encapPreviewHeader: document.getElementById('encap-preview-header'),
   encapReadonly,
-  encapReferenceSection,
   encapReferences,
   encapRemovePort,
   encapRows,
@@ -685,9 +702,25 @@ const panel = createPanel({
 
 const preview = createPreview({
   app,
+  cancelBoardPortDrag: () => input?.cancelPortDrag(),
   encapPreview,
+  revealDraftPort: panel.revealDraftPort,
   syncDraftPanel,
-  toast
+  toggleDraftInput,
+  toast,
+  updateMode(mode, draft) {
+    for (const [tabMode, button, section] of encapPreviewTabs) {
+      const active = mode === tabMode;
+      button.setAttribute('aria-pressed', String(active));
+      section.hidden = !active;
+    }
+    const description = mode === 'test'
+      ? (draft.inspection ? '元件测试预览，振荡现场输入已冻结' : '元件测试预览，点击输入管脚切换 0 或 1')
+      : '元件外观预览';
+    encapPreview.setAttribute('aria-label', description);
+    encapPreview.title = description;
+    updateCursor();
+  }
 });
 
 const controller = createController({
@@ -731,7 +764,6 @@ const controller = createController({
   onDefinitionSaved: markNewDefinition,
   get iconPicker() { return iconPicker; },
   get input() { return input; },
-  resetEncapSections,
   revealWorkbenchCanvas,
   get session() { return session; },
   startWorkbenchPreview,
@@ -886,7 +918,7 @@ function updateCursor() {
   if (app.mode === 'erase-port') {
     const cursor = eraserCursor();
     canvas.style.cursor = cursor;
-    if (encapPreview) encapPreview.style.cursor = cursor;
+    if (encapPreview) encapPreview.style.cursor = preview.getMode() === 'layout' ? cursor : 'default';
     return;
   }
   if (encapPreview) encapPreview.style.cursor = 'default';
@@ -1023,20 +1055,26 @@ async function addPortFromPick(binding) {
 
 function removeDraftPort(portId) {
   const draft = app.draft;
-  if (!draft) return;
-  if (draft.readOnly) return;
-  app.editDraftHistory(() => {
-    draft.ports = draft.ports.filter(function (port) { return port.id !== portId; });
-    delete draft.inputs[portId];
-    const result = evaluateDraft(draft, draft.evaluation);
-    if (result.ok) {
-      draft.evaluation = result;
-      app.evaluation = result;
+  if (!draft || draft.readOnly) return false;
+  const removed = app.editDraftHistory(() => {
+    const ports = draft.ports.filter(port => port.id !== portId);
+    const inputs = { ...draft.inputs };
+    delete inputs[portId];
+    const result = evaluateDraft({ ...draft, ports, inputs }, draft.evaluation);
+    if (!result.ok) {
+      toast.show('求值失败：' + (result.reason || '未知错误'));
+      return false;
     }
+    draft.ports = ports;
+    draft.inputs = inputs;
+    draft.evaluation = result;
+    app.evaluation = result;
   });
+  if (!removed) return false;
   syncDraftPanel();
   updateRuntimeStatus();
   app.render();
+  return true;
 }
 
 function changePortSide(port, side) {
@@ -1121,12 +1159,13 @@ async function editClockPeriod(componentId) {
   return true;
 }
 
-function toggleDraftInput(port) {
+function toggleDraftInput(portId) {
   const draft = app.draft;
   // 测试只改变临时运行态，不写定义/Session；只读详情也允许测试。
-  if (!draft || draft.inspection || port.direction !== 'in') return;
+  if (!draft || draft.inspection || !draft.ports.some(port => port.id === portId && port.direction === 'in') ||
+      Object.hasOwn(draftTestValues(draft).pausedInputs, portId)) return;
   const change = () => {
-    const next = Object.assign({}, draft.inputs, { [port.id]: draft.inputs[port.id] ? 0 : 1 });
+    const next = { ...draft.inputs, [portId]: draft.inputs[portId] ? 0 : 1 };
     const result = evaluateDraft(Object.assign({}, draft, { inputs: next }), draft.evaluation);
     if (!result.ok) {
       toast.show('求值失败：' + (result.reason || '未知错误'));
@@ -1140,13 +1179,12 @@ function toggleDraftInput(port) {
   if (draft.readOnly) change();
   else app.editDraftHistory(change);
   updateRuntimeStatus();
-  syncDraftPanel();
+  renderDraftTestPins();
+  if (preview.getMode() === 'test') renderDraftPreview();
   app.render();
 }
 
 function syncDraftPortSelectionHighlight(...args) { return panel.syncDraftPortSelectionHighlight(...args); }
-
-// 只读测试区展示 OUT 管脚当前值；pin 绑定直接读 pinValue，wire 绑定才建网。
 
 function renderDraftTestPins(...args) { return panel.renderDraftTestPins(...args); }
 
@@ -1383,8 +1421,6 @@ function renderDraftPreview(...args) { return preview.renderDraftPreview(...args
 function syncWorkbenchCrumb(...args) { return panel.syncWorkbenchCrumb(...args); }
 
 function syncWorkbenchHeading(...args) { return panel.syncWorkbenchHeading(...args); }
-
-function resetEncapSections(...args) { return panel.resetEncapSections(...args); }
 
 function syncDraftPortButtons(...args) { return panel.syncDraftPortButtons(...args); }
 
@@ -2065,6 +2101,7 @@ function handleWorkbenchOutsidePointer(event) {
   if (!draft || !encapWorkbench) {
     return;
   }
+  if (encapWorkbench.contains(event.target)) return;
   // 只读详情或未做任何修改的草稿可直接点击图纸区域关闭；有修改时避免误触丢失。
   if (!draft.readOnly && draftHasChanges(draft, encapName ? encapName.value.trim() : draft.name)) {
     return;
@@ -2115,10 +2152,14 @@ if (encapTab) {
   });
 }
 if (encapPreview) {
+  for (const [mode, button] of encapPreviewTabs) {
+    button.addEventListener('click', () => preview.setMode(mode));
+  }
   encapPreview.addEventListener('pointerdown', handlePreviewPointerDown);
   encapPreview.addEventListener('pointermove', handlePreviewPointerMove);
   encapPreview.addEventListener('pointerup', handlePreviewPointerUp);
   encapPreview.addEventListener('pointercancel', handlePreviewPointerCancel);
+  encapPreview.addEventListener('lostpointercapture', handlePreviewPointerCancel);
   encapPreview.addEventListener('pointerleave', handlePreviewPointerLeave);
   encapPreview.addEventListener('dblclick', handlePreviewDoubleClick);
   encapPreview.addEventListener('wheel', handlePreviewWheel, { passive: false });

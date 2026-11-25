@@ -1,19 +1,78 @@
 // 封装面板：DOM 展示与控件同步。
-import { rootDraftOf, draftChainOf, draftDisplayName } from "./encapsulation-model.js";
-import { slotCount } from '../core/geometry.js';
-import { buildNets } from '../core/nets.js';
-import { bindingValue } from '../core/ports.js';
+import { rootDraftOf, draftChainOf, draftDisplayName, draftTestValues } from "./encapsulation-model.js";
+import { slotCount, slotOffset } from '../core/geometry.js';
 import { definitionReferenceTree } from './library.js';
+
+const PORT_LIST_SIDES = ['left', 'right', 'top', 'bottom'];
+const NUMBERED_TEST_PORT = /^([a-z]+)\d+$/i;
+const compareTestPortNames = new Intl.Collator('en', { numeric: true, sensitivity: 'base' }).compare;
+
+function portsInPreviewOrder(draft) {
+  return draft.ports.map(port => {
+    // 交界槽位的编号追加在末尾，列表顺序以实际坐标为准。
+    const point = slotOffset(draft.rows, draft.cols, port.side, port.slot);
+    if (!point) return { port, edge: PORT_LIST_SIDES.length, position: 0 };
+    const edge = PORT_LIST_SIDES.indexOf(port.side);
+    const position = port.side === 'left' || port.side === 'right' ? point.y : point.x;
+    return { port, edge, position };
+  }).sort((a, b) => a.edge - b.edge || a.position - b.position)
+    .map(entry => entry.port);
+}
+
+function testPortGroups(ports) {
+  const groups = [];
+  let current = null;
+  for (const port of ports) {
+    const prefix = NUMBERED_TEST_PORT.exec(port.name)?.[1].toUpperCase() ?? null;
+    if (!current || current.prefix !== prefix) {
+      current = { prefix, ports: [] };
+      groups.push(current);
+    }
+    current.ports.push(port);
+  }
+  return groups.map(({ prefix, ports: groupPorts }) => {
+    if (prefix) {
+      groupPorts.sort((a, b) => compareTestPortNames(b.name, a.name));
+    }
+    return groupPorts;
+  });
+}
 
 // context 显式注入所需的应用对象、元素、服务与跨模块回调。
 export function createPanel(context) {
   const SIDE_LABELS = { top: '上', bottom: '下', left: '左', right: '右' };
+  let renderedTestDraft = null;
+  let renderedTestLayout = null;
+  const testPins = new Map();
+  let renderedReferenceDraft = null;
+  let renderedReferenceKey = null;
 
   function syncDraftPortSelectionHighlight() {
     const selectedId = context.app.selection.kind === 'port' ? context.app.selection.id : null;
     for (const row of context.encapPorts.querySelectorAll('.encap-port')) {
       row.classList.toggle('selected', row.dataset.portId === selectedId);
     }
+  }
+
+  function revealDraftPort(portId) {
+    const { encapPanel, encapPortSection, encapPorts, encapPreviewHeader } = context;
+    const selection = context.app.selection;
+    if (encapPortSection.hidden || selection.kind !== 'port' || selection.id !== portId) return;
+    const row = Array.from(encapPorts.children).find(item => item.dataset.portId === portId);
+    if (!row) return;
+
+    const sticky = encapPreviewHeader.getClientRects().length
+      ? encapPreviewHeader : encapPreviewHeader.querySelector('#encap-preview-tabs');
+    const header = sticky.getBoundingClientRect();
+    const panelTop = encapPanel.getBoundingClientRect().top + encapPanel.clientTop;
+    const panelBottom = panelTop + encapPanel.clientHeight;
+    const bounds = row.getBoundingClientRect();
+    if (bounds.top >= header.bottom && bounds.bottom <= panelBottom) return;
+
+    // 滚动后预览和标签可能吸顶，将管脚行放到整个区域下方。
+    const pinnedBottom = panelTop + header.height;
+    const gap = Math.min(8, Math.max(0, Math.floor(panelBottom - pinnedBottom - bounds.height)));
+    encapPanel.scrollTop += bounds.top - (pinnedBottom + gap);
   }
 
   function selectDraftPort(portId) {
@@ -39,7 +98,7 @@ export function createPanel(context) {
       context.encapPorts.appendChild(empty);
       return;
     }
-    for (const port of draft.ports) {
+    for (const port of portsInPreviewOrder(draft)) {
       const row = document.createElement('div');
       row.className = 'encap-port';
       row.dataset.portId = port.id;
@@ -118,28 +177,6 @@ export function createPanel(context) {
     syncDraftPortSelectionHighlight();
   }
 
-  function draftOutputValues(draft, outputs) {
-    const evaluation = draft.evaluation;
-    let built = null;
-    const values = {};
-    for (const port of outputs) {
-      const binding = port && port.binding;
-      const pinKey = binding && binding.kind === 'pin'
-        ? binding.componentId + ':' + binding.pinId
-        : null;
-      if (pinKey && evaluation && evaluation.pinValue &&
-          Object.prototype.hasOwnProperty.call(evaluation.pinValue, pinKey)) {
-        values[port.id] = bindingValue(evaluation, null, binding);
-        continue;
-      }
-      if (!built) {
-        built = buildNets(draft.state, { definitions: draft.library, includeBarePins: true });
-      }
-      values[port.id] = bindingValue(evaluation, built, binding);
-    }
-    return values;
-  }
-
   function createTestRow(label) {
     const row = document.createElement('div');
     row.className = 'encap-test-row';
@@ -147,67 +184,88 @@ export function createPanel(context) {
     tag.className = 'encap-test-label';
     tag.textContent = label;
     const items = document.createElement('div');
-    items.className = 'encap-test-items';
+    items.className = 'encap-test-groups';
     row.appendChild(tag);
     row.appendChild(items);
     return { row, items };
   }
 
-  function renderDraftTestPins() {
-    const draft = context.app.draft;
+  function createTestPin(port, group) {
+    const isInput = port.direction === 'in';
+    const pin = document.createElement(isInput ? 'button' : 'span');
+    pin.dataset.portId = port.id;
+    group.appendChild(pin);
+    const note = isInput ? document.createElement('span') : null;
+    if (note) {
+      note.className = 'encap-hint encap-test-pause-reason';
+      group.appendChild(note);
+      pin.type = 'button';
+      pin.addEventListener('click', () => {
+        if (!pin.disabled) context.toggleDraftInput(port.id);
+      });
+    } else {
+      pin.className = 'encap-output';
+    }
+    testPins.set(port.id, { pin, note });
+  }
+
+  function rebuildTestList(draft) {
     context.encapInputs.textContent = '';
-    if (!draft) return;
-    const inputs = draft.ports.filter(function (port) { return port.direction === 'in'; });
-    const outputs = draft.ports.filter(function (port) { return port.direction === 'out'; });
-    if (inputs.length === 0 && outputs.length === 0) {
+    testPins.clear();
+    if (draft.ports.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'encap-hint';
       empty.textContent = '没有管脚。';
       context.encapInputs.appendChild(empty);
       return;
     }
-    if (inputs.length > 0) {
-      const group = createTestRow('IN');
-      for (const port of inputs) {
-        const button = document.createElement('button');
-        button.type = 'button';
-        const value = draft.inputs[port.id] ? 1 : 0;
-        button.textContent = port.name + ': ' + value;
-        button.classList.toggle('on', value === 1);
-        button.disabled = Boolean(draft.inspection);
-        if (draft.inspection) button.title = '振荡现场输入已冻结';
-        button.addEventListener('click', function () {
-          if (!draft.inspection) context.toggleDraftInput(port);
-        });
-        group.items.appendChild(button);
+    const ordered = portsInPreviewOrder(draft);
+    for (const [direction, label] of [['in', 'IN'], ['out', 'OUT']]) {
+      const ports = ordered.filter(port => port.direction === direction);
+      if (ports.length === 0) continue;
+      const { row, items } = createTestRow(label);
+      for (const group of testPortGroups(ports)) {
+        const pins = document.createElement('div');
+        pins.className = 'encap-test-items';
+        for (const port of group) createTestPin(port, pins);
+        items.appendChild(pins);
       }
-      context.encapInputs.appendChild(group.row);
+      context.encapInputs.appendChild(row);
     }
-    if (outputs.length > 0) {
-      const group = createTestRow('OUT');
-      const values = draftOutputValues(draft, outputs);
-      for (const port of outputs) {
-        const value = values[port.id] === 1 ? 1 : 0;
-        const chip = document.createElement('span');
-        chip.className = 'encap-output';
-        chip.dataset.portId = port.id;
-        chip.dataset.value = String(value);
-        chip.textContent = port.name + ': ' + value;
-        chip.classList.toggle('on', value === 1);
-        group.items.appendChild(chip);
+  }
+
+  function renderDraftTestPins() {
+    const draft = context.app.draft;
+    if (!draft) return;
+    const layout = JSON.stringify([draft.rows, draft.cols, draft.ports.map(port =>
+      [port.id, port.name, port.direction, port.side, port.slot])]);
+    if (draft !== renderedTestDraft || layout !== renderedTestLayout) {
+      rebuildTestList(draft);
+      renderedTestDraft = draft;
+      renderedTestLayout = layout;
+    }
+    const { inputs, outputs, pausedInputs } = draftTestValues(draft);
+    for (const port of draft.ports) {
+      const { pin, note } = testPins.get(port.id);
+      const reason = Object.hasOwn(pausedInputs, port.id) ? pausedInputs[port.id] : '';
+      const value = reason ? '—' : (note ? inputs[port.id] : outputs[port.id]);
+      const text = port.name + ': ' + value;
+      if (pin.textContent !== text) pin.textContent = text;
+      pin.dataset.value = String(value);
+      pin.classList.toggle('on', value === 1);
+      if (note) {
+        pin.disabled = Boolean(draft.inspection || reason);
+        pin.title = reason || (draft.inspection ? '振荡现场输入已冻结' : '');
+        note.hidden = !reason;
+        if (note.textContent !== reason) note.textContent = reason;
       }
-      context.encapInputs.appendChild(group.row);
     }
   }
 
   function createReferenceLabel(node) {
     const badge = document.createElement('span');
-    badge.className = 'encap-ref-badge encap-ref-badge-' + (
-      node.kind === 'current' ? 'current'
-        : node.kind === 'session' ? 'session'
-          : 'definition'
-    );
-    badge.textContent = node.kind === 'current' ? '当前' : (node.kind === 'session' ? '图纸' : '元件');
+    badge.className = 'encap-ref-badge encap-ref-badge-' + node.kind;
+    badge.textContent = node.kind === 'session' ? '图纸' : '元件';
     const name = document.createElement('span');
     name.className = 'encap-ref-name';
     name.textContent = node.name;
@@ -249,37 +307,29 @@ export function createPanel(context) {
   function renderDraftReferences() {
     const draft = context.app.draft;
     if (!context.encapReferences || !draft) return;
-    if (!context.session) {
-      if (draft.referenceRenderedKey === 'no-session') return;
-      draft.referenceRenderedKey = 'no-session';
-      context.encapReferences.textContent = '';
-      const empty = document.createElement('div');
-      empty.className = 'encap-hint';
-      empty.textContent = 'Session 尚未就绪。';
-      context.encapReferences.appendChild(empty);
-      return;
-    }
     // 引用关系来自已保存的定义库与主图纸；draft.library 会排除当前定义，不能用于此树。
-    // 用库/主图纸 revision 作为缓存键，避免管脚编辑或测试切换时重复扫描整个定义库。
-    const status = context.session.getStatus();
-    const renderedKey = [
+    // 引用树共用一个容器，切换草稿时需要重新渲染。
+    const session = context.session;
+    const status = session?.getStatus();
+    const renderedKey = status ? [
       status.libraryReady ? 'ready' : 'loading',
       status.libraryRevision,
       status.revision,
       draft.definitionId || ''
-    ].join(':');
-    if (draft.referenceRenderedKey === renderedKey) return;
-    draft.referenceRenderedKey = renderedKey;
+    ].join(':') : 'no-session';
+    if (draft === renderedReferenceDraft && renderedKey === renderedReferenceKey) return;
+    renderedReferenceDraft = draft;
+    renderedReferenceKey = renderedKey;
     context.encapReferences.textContent = '';
-    if (!draft.definitionId) {
+    if (!session || !draft.definitionId) {
       const empty = document.createElement('div');
       empty.className = 'encap-hint';
-      empty.textContent = '保存为元件后可查看引用关系。';
+      empty.textContent = session ? '保存为元件后可查看引用关系。' : 'Session 尚未就绪。';
       context.encapReferences.appendChild(empty);
       return;
     }
     const tree = definitionReferenceTree(
-      context.session.getLibrary(),
+      session.getLibrary(),
       rootDraftOf(draft).previous.state,
       draft.definitionId
     );
@@ -290,17 +340,7 @@ export function createPanel(context) {
       context.encapReferences.appendChild(empty);
       return;
     }
-    const root = document.createElement('details');
-    root.className = 'encap-ref-root';
-    root.open = true;
-    const summary = document.createElement('summary');
-    summary.appendChild(createReferenceLabel(tree));
-    root.appendChild(summary);
-    const list = document.createElement('div');
-    list.className = 'encap-ref-children';
-    for (const child of tree.references) appendReferenceNode(list, child);
-    root.appendChild(list);
-    context.encapReferences.appendChild(root);
+    for (const child of tree.references) appendReferenceNode(context.encapReferences, child);
   }
 
   function syncWorkbenchCrumb(draft) {
@@ -340,12 +380,6 @@ export function createPanel(context) {
       context.encapKind.hidden = Boolean(draft.readOnly) && !draft.inspection;
       context.encapKind.textContent = draft.inspection ? '冻结现场' : draft.readOnly ? '' : (draft.definitionId ? '编辑中' : '新建');
     }
-  }
-
-  function resetEncapSections() {
-    if (context.encapPortSection) context.encapPortSection.open = false;
-    if (context.encapInputSection) context.encapInputSection.open = false;
-    if (context.encapReferenceSection) context.encapReferenceSection.open = false;
   }
 
   function syncDraftPortButtons() {
@@ -402,6 +436,11 @@ export function createPanel(context) {
     }
     context.canvas.classList.toggle('encap-board', open);
     if (!open) {
+      renderedTestDraft = null;
+      renderedTestLayout = null;
+      testPins.clear();
+      context.encapInputs.textContent = '';
+      renderedReferenceDraft = null;
       if (context.iconPicker) context.iconPicker.close();
       context.canvas.classList.remove('encap-board-revealed');
       syncWorkbenchHeading(null);
@@ -456,7 +495,7 @@ export function createPanel(context) {
         : '只读查看；可在“测试”区临时切换 IN 观察 OUT，不会保存；' +
           (draft.editBlockedReason || '当前不能编辑该定义') + '。';
     } else {
-      context.encapHint.textContent = '画内部电路；展开“测试”可切换 IN 并查看 OUT。保存时会把所有 IN 归零并重新求值，保留内部非零记忆。';
+      context.encapHint.textContent = '画内部电路；切到“测试”可切换 IN 并查看 OUT。保存时会把所有 IN 归零并重新求值，保留内部非零记忆。';
     }
     if (context.app.selection.kind === 'port' &&
         !(draft.ports || []).some(function (port) { return port.id === context.app.selection.id; })) {
@@ -470,5 +509,5 @@ export function createPanel(context) {
     syncSideTabsTop();
   }
 
-  return { renderDraftTestPins, resetEncapSections, syncDraftPanel, syncDraftPortButtons, syncDraftPortSelectionHighlight, syncSideTabsTop, syncWorkbenchCrumb, syncWorkbenchHeading };
+  return { renderDraftTestPins, revealDraftPort, syncDraftPanel, syncDraftPortButtons, syncDraftPortSelectionHighlight, syncSideTabsTop, syncWorkbenchCrumb, syncWorkbenchHeading };
 }

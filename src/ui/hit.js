@@ -338,8 +338,16 @@ export function framesInRect(state, view, rect) {
 // 最近的悬空端点（free）；返回导线、端侧与端点坐标。
 // options.excludeWireId 用于拖动某条线端点时排除它自身。
 export function nearestFreeEnd(state, view, world, options = {}) {
-  const tolerance = hitTolerance(view);
-  const excludeWireId = options.excludeWireId;
+  return nearestWireEnd(state, world, 'free', hitTolerance(view), options.excludeWireId);
+}
+
+export function nearestJunctionEnd(state, view, world) {
+  // 命中区与可见 T 点相近，避免盖住相邻网格线的线身操作。
+  const tolerance = Math.min(WIRE_GRID / 2, 5 / scaleOf(view));
+  return nearestWireEnd(state, world, 'junction', tolerance);
+}
+
+function nearestWireEnd(state, world, kind, tolerance, excludeWireId) {
   let best = null;
   for (const wireId of Object.keys(state.wires)) {
     if (wireId === excludeWireId) {
@@ -355,7 +363,7 @@ export function nearestFreeEnd(state, view, world, options = {}) {
       { end: wire.endB, side: 'B', point: points[points.length - 1] }
     ];
     for (const item of ends) {
-      if (!item.end || item.end.kind !== 'free') {
+      if (item.end?.kind !== kind) {
         continue;
       }
       const dist = distance(world, item.point);
