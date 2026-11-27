@@ -1,13 +1,12 @@
 import { createController } from "./ui/encapsulation-controller.js";
 import { createPreview } from "./ui/encapsulation-preview.js";
 import { createPanel } from "./ui/encapsulation-panel.js";
-import { cloneValue, rootDraftOf, draftRuntimeOptions, draftTestValues, invalidateDraftRuntime, evaluateDraft, resolvePortNet, freeSlotFor, normalizeDraftPorts, draftHasChanges } from "./ui/encapsulation-model.js";
+import { cloneValue, rootDraftOf, draftRuntimeOptions, draftTestValues, invalidateDraftRuntime, evaluateDraft, PORT_NAME_MAX_LENGTH, suggestPortName, checkPortPick, addDraftPort, draftPortAnnotations, remapDraftPortBindings, firstFreeSlotOnSide, moveDraftPort, freeSlotFor, normalizeDraftPorts, draftHasChanges } from "./ui/encapsulation-model.js";
 // 入口：持有 state/view/selection，装配元件栏、工具栏、菜单、toast 与输入。
 import { CLOCK_MAX_PERIOD, CLOCK_MIN_PERIOD } from './core/entities.js';
 import { createState } from './core/state.js';
 import { evaluateDynamic } from './core/dynamic.js';
 import { commitResult } from './core/runtime.js';
-import { bindingNetId } from './core/ports.js';
 import { createSnapshot, prepareSnapshotRestore } from './core/snapshot.js';
 import { createEditHistory, captureDraftHistory, restoreDraftHistory } from './ui/edit-history.js';
 import {
@@ -16,7 +15,7 @@ import {
   normalizeClockPeriod,
   resetClockRuntime
 } from './core/clock.js';
-import { CELL, componentBounds, componentDefinition, componentPins, pinWorld, pointInBounds, slotCount, slotOffset } from './core/geometry.js';
+import { CELL, componentBounds, componentDefinition, componentPins, pointInBounds, slotOffset } from './core/geometry.js';
 
 import { placeComponent, resetClocksCommand, setClockPeriodCommand } from './core/commands.js';
 import { clampScale, hitPortAnnotation, hitPortAnnotationLabel, previewPortLabelRects, previewPortSlots, render, screenToWorld, worldToScreen } from './ui/view.js';
@@ -483,7 +482,7 @@ const app = {
     return null;
   },
   previewPortTarget(clientX, clientY, portId) {
-    return previewPortTarget(this.draft, clientX, clientY, portId);
+    return preview.previewPortTarget(this.draft, clientX, clientY, portId);
   },
   setPortDrag(portId, target) {
     this.overlay.portDrag = portId ? { portId, target: target || null } : null;
@@ -492,14 +491,9 @@ const app = {
     }
   },
   dropPortAt(clientX, clientY, portId) {
-    const target = previewPortTarget(this.draft, clientX, clientY, portId);
+    const target = preview.hitPreviewPortSlot(this.draft, clientX, clientY);
     this.overlay.portDrag = null;
-    let moved = false;
-    if (target && target.valid) {
-      moved = moveDraftPortToSlot(portId, target.side, target.slot);
-    } else if (target && !target.valid) {
-      toast.show('该槽位已被其他管脚占用');
-    }
+    const moved = target ? moveDraftPortToSlot(portId, target.side, target.slot) : false;
     if (this.draft) {
       renderDraftPreview();
     }
@@ -607,16 +601,7 @@ const app = {
     let evaluationOptions = { definitions: this.getDefinitions() };
     let updatedPorts;
     if (this.draft && result?.wireEndpointRemaps?.length) {
-      const byWire = new Map(result.wireEndpointRemaps.map(({ wireId, ends }) => [wireId, ends]));
-      updatedPorts = this.draft.ports.map(port => {
-        const binding = port.binding;
-        const ends = binding?.kind === 'wire' ? byWire.get(binding.wireId) : null;
-        if (!ends) return port;
-        const { end, ...previous } = binding;
-        const next = { ...previous, wireId: result.id };
-        if ((end === 'A' || end === 'B') && ends[end]) next.end = ends[end];
-        return { ...port, binding: next };
-      });
+      updatedPorts = remapDraftPortBindings(this.draft.ports, result.id, result.wireEndpointRemaps);
     }
     if (this.draft && result?.ok && result.state && !(result.geometryOnly && this.evaluation?.status)) {
       if (result.state === this.draft.state) invalidateDraftRuntime(result.state);
@@ -711,9 +696,7 @@ const preview = createPreview({
   cancelBoardPortDrag: () => input?.cancelPortDrag(),
   encapPreview,
   revealDraftPort: panel.revealDraftPort,
-  syncDraftPanel,
   toggleDraftInput,
-  toast,
   updateMode(mode, draft) {
     for (const [tabMode, button, section] of encapPreviewTabs) {
       const active = mode === tabMode;
@@ -825,51 +808,6 @@ function updateRuntimeStatus() {
       app.evaluation.oscillation.componentIds.some(id => app.state.components[id]?.type === 'CUSTOM')) {
     runtimeStatus.textContent += '右键红色封装，选择“详细”可逐层定位。';
   }
-}
-
-function draftPortAnchor(draft, binding) {
-  if (!binding) return null;
-  if (binding.kind === 'pin') {
-    const component = draft.state.components[binding.componentId];
-    if (!component) return null;
-    try {
-      const bounds = componentBounds(component, draft.library);
-      return {
-        point: pinWorld(component, binding.pinId, draft.library),
-        center: bounds ? { x: bounds.x + bounds.w / 2, y: bounds.y + bounds.h / 2 } : null
-      };
-    } catch (error) {
-      return null;
-    }
-  }
-  if (binding.kind === 'wire') {
-    const wire = draft.state.wires[binding.wireId];
-    const points = wire && wire.points;
-    if (!points || points.length === 0) return null;
-    const side = binding.end === 'A' || binding.end === 'B'
-      ? binding.end
-      : (wire.endA?.kind !== 'free' && wire.endB?.kind === 'free' ? 'B' : 'A');
-    const point = side === 'B' ? points[points.length - 1] : points[0];
-    return { point, center: null };
-  }
-  return null;
-}
-
-function draftPortAnnotations(draft) {
-  if (!draft) return null;
-  const annotations = [];
-  for (const port of draft.ports || []) {
-    const anchor = draftPortAnchor(draft, port.binding);
-    if (!anchor) continue;
-    annotations.push({
-      id: port.id,
-      name: port.name,
-      direction: port.direction,
-      point: anchor.point,
-      center: anchor.center
-    });
-  }
-  return annotations;
 }
 
 function renderFrame(timestamp = performance.now()) {
@@ -984,48 +922,6 @@ function changeDraftSize(rows, cols) {
   app.render();
 }
 
-const PORT_NAME_MAX_LENGTH = 40;
-
-function suggestPortName(ports, direction) {
-  for (let index = ports.length - 1; index >= 0; index -= 1) {
-    const port = ports[index];
-    if (port.direction !== direction) continue;
-    const previousName = port.name.trim();
-    const suffix = /[0-9]+$/.exec(previousName);
-    if (suffix) {
-      const digits = suffix[0];
-      const next = String(BigInt(digits) + 1n).padStart(digits.length, '0');
-      const name = previousName.slice(0, suffix.index) + next;
-      if (name.length <= PORT_NAME_MAX_LENGTH) return name;
-    }
-    break;
-  }
-  return (direction === 'in' ? 'IN' : 'OUT') + (ports.length + 1);
-}
-
-function checkPortPick(draft, binding) {
-  const resolved = resolvePortNet(draft, binding);
-  const point = draftPortAnchor(draft, binding)?.point;
-  if (!resolved.net || !point) {
-    return { reason: '无法解析该连接点的内部 Net' };
-  }
-  if (resolved.net.driverPins.length > 1) {
-    return { reason: '该 Net 有多个驱动，不能标注' };
-  }
-  const direction = resolved.net.driverPins.length === 0 ? 'in' : 'out';
-  for (const port of draft.ports) {
-    if (bindingNetId(resolved.built, port.binding) !== resolved.netId) continue;
-    const existing = draftPortAnchor(draft, port.binding)?.point;
-    if (existing?.x === point.x && existing.y === point.y) {
-      return { reason: '该位置已标注封装管脚' };
-    }
-    if (direction === 'in' && port.direction === 'in') {
-      return { reason: '同一个内部 Net 只能标注一个输入管脚' };
-    }
-  }
-  return { direction };
-}
-
 async function addPortFromPick(binding) {
   const draft = app.draft;
   if (!draft || draft.readOnly) return;
@@ -1061,24 +957,7 @@ async function addPortFromPick(binding) {
     return;
   }
   app.editDraftHistory(() => {
-    let id = 'p' + draft.nextPortNumber;
-    draft.nextPortNumber += 1;
-    while (draft.ports.some(function (port) { return port.id === id; })) {
-      id = 'p' + draft.nextPortNumber;
-      draft.nextPortNumber += 1;
-    }
-    draft.ports.push({
-      id,
-      name: trimmed,
-      direction,
-      binding: cloneValue(binding),
-      side: slot.side,
-      slot: slot.slot
-    });
-    if (draft.portPlacementCursors?.[direction]?.side === slot.side) {
-      draft.portPlacementCursors[direction] = slot;
-    }
-    if (direction === 'in') draft.inputs[id] = 0;
+    addDraftPort(draft, binding, trimmed, direction, slot);
   });
   syncDraftPanel();
   app.render();
@@ -1113,18 +992,8 @@ function changePortSide(port, side) {
   const draft = app.draft;
   if (!draft) return;
   if (draft.readOnly) return;
-  const used = new Set(draft.ports.filter(function (item) {
-    return item !== port && item.side && Number.isInteger(item.slot);
-  }).map(function (item) { return item.side + ':' + item.slot; }));
-  const count = slotCount(draft.rows, draft.cols, side);
-  let target = -1;
-  for (let slot = 0; slot < count; slot += 1) {
-    if (!used.has(side + ':' + slot)) {
-      target = slot;
-      break;
-    }
-  }
-  if (target < 0) {
+  const target = firstFreeSlotOnSide(draft, side, port);
+  if (target === null) {
     toast.show('该边没有空余槽位');
     syncDraftPanel();
     return;
@@ -1390,7 +1259,7 @@ async function editDraftPortLabel(portId) {
     message: '输入新的管脚名称',
     label: '名称',
     value: port.name,
-    maxLength: 40,
+    maxLength: PORT_NAME_MAX_LENGTH,
     confirmLabel: '确定',
     cancelLabel: '取消'
   });
@@ -1417,8 +1286,6 @@ async function editDraftPortLabel(portId) {
 
 function draftPreviewDefinition(...args) { return preview.draftPreviewDefinition(...args); }
 
-function previewPortTarget(...args) { return preview.previewPortTarget(...args); }
-
 function handlePreviewPointerDown(...args) { return preview.handlePreviewPointerDown(...args); }
 
 function handlePreviewPointerMove(...args) { return preview.handlePreviewPointerMove(...args); }
@@ -1433,8 +1300,14 @@ function handlePreviewWheel(...args) { return preview.handlePreviewWheel(...args
 
 function handlePreviewDoubleClick(...args) { return preview.handlePreviewDoubleClick(...args); }
 
-function moveDraftPortToSlot(...args) {
-  return app.editDraftHistory(() => preview.moveDraftPortToSlot(...args));
+function moveDraftPortToSlot(portId, side, slot) {
+  const moved = app.editDraftHistory(() => {
+    const result = moveDraftPort(app.draft, portId, side, slot);
+    if (result === 'occupied') toast.show('该槽位已被其他管脚占用');
+    return result === 'ok';
+  });
+  if (moved) syncDraftPanel();
+  return moved;
 }
 
 function renderDraftPreview(...args) { return preview.renderDraftPreview(...args); }

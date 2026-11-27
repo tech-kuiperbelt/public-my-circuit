@@ -2274,9 +2274,17 @@ function validateWirePath(state, wireId, points, definitionOptions, validation, 
   return checked.ok ? { ok: true, points } : checked;
 }
 
+// 只解析支线端点与宿主的关系，拼接几何由候选规划校验。
+export function wireJunctionEnd(state, wireId, side, hostId) {
+  const wire = state.wires[wireId];
+  if (!wire || (side !== 'A' && side !== 'B')) return null;
+  const end = wireEnd(wire, side);
+  return end?.kind === 'junction' && (hostId === undefined || end.wireId === hostId) ? end : null;
+}
+
 // 同一根宿主上，只有 T 点所在末段的 free 端可以和该 T 点合并。
 function freeEndOfJunctionSegment(state, end, point) {
-  if (end.kind !== 'junction' || !isWireGridPoint(end.point)) return null;
+  if (!end || !isWireGridPoint(end.point)) return null;
   for (const side of ['A', 'B']) {
     const target = freeSideInfo(state, end.wireId, side);
     if (!target || !samePoint(target.point, point)) continue;
@@ -2324,9 +2332,9 @@ function collapseJunctionsAfterSegmentDrag(state, wireId, moved, branches, defin
   const originalEnds = [wire.points[0], wire.points[wire.points.length - 1]];
   const collapses = [];
   for (const side of ['A', 'B']) {
-    const end = wireEnd(wire, side);
+    const end = wireJunctionEnd(state, wireId, side);
     const point = endpointPoint(moved.points, side === 'A');
-    const hostSide = end && freeEndOfJunctionSegment(state, end, point);
+    const hostSide = freeEndOfJunctionSegment(state, end, point);
     if (hostSide) collapses.push({ side, hostId: end.wireId, hostSide });
   }
   if (!collapses.length) return null;
@@ -2493,11 +2501,11 @@ function planCollapseMovedFreeEnd(state, wireId, side, point, definitionOptions)
   const atStart = side === 'A';
   const adjacent = atStart ? points[1] : points[points.length - 2];
   if (!pointOnSegmentInterior(point, source.point, adjacent)) return null;
-  for (const [branchId, branch] of Object.entries(state.wires)) {
+  for (const branchId of Object.keys(state.wires)) {
     if (branchId === wireId) continue;
     for (const branchSide of ['A', 'B']) {
-      const end = wireEnd(branch, branchSide);
-      if (end?.kind !== 'junction' || end.wireId !== wireId || !samePoint(end.point, point)) continue;
+      const end = wireJunctionEnd(state, branchId, branchSide, wireId);
+      if (!end || !samePoint(end.point, point)) continue;
       const shortened = atStart ? [point, ...points.slice(1)] : [...points.slice(0, -1), point];
       return planWireCorner(state, wireId, side, branchId, branchSide, shortened, definitionOptions);
     }
@@ -2508,8 +2516,8 @@ function planCollapseMovedFreeEnd(state, wireId, side, point, definitionOptions)
 function planCollapseMovedJunction(state, wireId, side, point, definitionOptions) {
   const wire = state.wires[wireId];
   if (!wire || !Array.isArray(wire.points) || (side !== 'A' && side !== 'B') || !isWireGridPoint(point)) return null;
-  const end = wireEnd(wire, side);
-  const hostSide = end && freeEndOfJunctionSegment(state, end, point);
+  const end = wireJunctionEnd(state, wireId, side);
+  const hostSide = freeEndOfJunctionSegment(state, end, point);
   if (!hostSide) return null;
   const atStart = side === 'A';
   const points = wire.points;

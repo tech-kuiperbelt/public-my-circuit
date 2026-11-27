@@ -1,5 +1,5 @@
 // 封装草稿的纯数据操作；不依赖 DOM 或应用实例。
-import { CELL, slotCount, slotOffset } from "../core/geometry.js";
+import { CELL, componentBounds, pinWorld, slotCount, slotOffset } from "../core/geometry.js";
 import { evaluateDynamic } from "../core/dynamic.js";
 import { buildNets } from "../core/nets.js";
 import { bindingNetId, bindingValue } from "../core/ports.js";
@@ -152,7 +152,7 @@ export function evaluateDraft(draft, previous) {
   return evaluateDynamic(draft.state, previous, undefined, draftRuntimeOptions(draft));
 }
 
-export function resolvePortNet(draft, binding) {
+function resolvePortNet(draft, binding) {
   const built = buildNets(draft.state, {
     definitions: draft.library,
     includeBarePins: true
@@ -165,47 +165,207 @@ export function resolvePortNet(draft, binding) {
   };
 }
 
+function draftPortAnchor(draft, binding) {
+  if (!binding) return null;
+  if (binding.kind === 'pin') {
+    const component = draft.state.components[binding.componentId];
+    if (!component) return null;
+    try {
+      const bounds = componentBounds(component, draft.library);
+      return {
+        point: pinWorld(component, binding.pinId, draft.library),
+        center: bounds ? { x: bounds.x + bounds.w / 2, y: bounds.y + bounds.h / 2 } : null
+      };
+    } catch (error) {
+      return null;
+    }
+  }
+  if (binding.kind === 'wire') {
+    const wire = draft.state.wires[binding.wireId];
+    const points = wire && wire.points;
+    if (!points || points.length === 0) return null;
+    const side = binding.end === 'A' || binding.end === 'B'
+      ? binding.end
+      : (wire.endA?.kind !== 'free' && wire.endB?.kind === 'free' ? 'B' : 'A');
+    const point = side === 'B' ? points[points.length - 1] : points[0];
+    return { point, center: null };
+  }
+  return null;
+}
+
+export function draftPortAnnotations(draft) {
+  if (!draft) return null;
+  const annotations = [];
+  for (const port of draft.ports || []) {
+    const anchor = draftPortAnchor(draft, port.binding);
+    if (!anchor) continue;
+    annotations.push({
+      id: port.id,
+      name: port.name,
+      direction: port.direction,
+      point: anchor.point,
+      center: anchor.center
+    });
+  }
+  return annotations;
+}
+
+export const PORT_NAME_MAX_LENGTH = 40;
+
+export function suggestPortName(ports, direction) {
+  for (let index = ports.length - 1; index >= 0; index -= 1) {
+    const port = ports[index];
+    if (port.direction !== direction) continue;
+    const previousName = port.name.trim();
+    const suffix = /[0-9]+$/.exec(previousName);
+    if (suffix) {
+      const digits = suffix[0];
+      const next = String(BigInt(digits) + 1n).padStart(digits.length, '0');
+      const name = previousName.slice(0, suffix.index) + next;
+      if (name.length <= PORT_NAME_MAX_LENGTH) return name;
+    }
+    break;
+  }
+  return (direction === 'in' ? 'IN' : 'OUT') + (ports.length + 1);
+}
+
+export function checkPortPick(draft, binding) {
+  const resolved = resolvePortNet(draft, binding);
+  const point = draftPortAnchor(draft, binding)?.point;
+  if (!resolved.net || !point) {
+    return { reason: '无法解析该连接点的内部 Net' };
+  }
+  if (resolved.net.driverPins.length > 1) {
+    return { reason: '该 Net 有多个驱动，不能标注' };
+  }
+  const direction = resolved.net.driverPins.length === 0 ? 'in' : 'out';
+  for (const port of draft.ports) {
+    if (bindingNetId(resolved.built, port.binding) !== resolved.netId) continue;
+    const existing = draftPortAnchor(draft, port.binding)?.point;
+    if (existing?.x === point.x && existing.y === point.y) {
+      return { reason: '该位置已标注封装管脚' };
+    }
+    if (direction === 'in' && port.direction === 'in') {
+      return { reason: '同一个内部 Net 只能标注一个输入管脚' };
+    }
+  }
+  return { direction };
+}
+
+export function addDraftPort(draft, binding, name, direction, slot) {
+  let id = 'p' + draft.nextPortNumber;
+  draft.nextPortNumber += 1;
+  while (draft.ports.some(function (port) { return port.id === id; })) {
+    id = 'p' + draft.nextPortNumber;
+    draft.nextPortNumber += 1;
+  }
+  draft.ports.push({
+    id,
+    name,
+    direction,
+    binding: cloneValue(binding),
+    side: slot.side,
+    slot: slot.slot
+  });
+  if (draft.portPlacementCursors?.[direction]?.side === slot.side) {
+    draft.portPlacementCursors[direction] = slot;
+  }
+  if (direction === 'in') draft.inputs[id] = 0;
+}
+
+export function remapDraftPortBindings(ports, wireId, remaps) {
+  const byWire = new Map(remaps.map(({ wireId, ends }) => [wireId, ends]));
+  return ports.map(port => {
+    const binding = port.binding;
+    const ends = binding?.kind === 'wire' ? byWire.get(binding.wireId) : null;
+    if (!ends) return port;
+    const { end, ...previous } = binding;
+    const next = { ...previous, wireId };
+    if ((end === 'A' || end === 'B') && ends[end]) next.end = ends[end];
+    return { ...port, binding: next };
+  });
+}
+
 const annotationSides = {
   in: ['left', 'top', 'bottom', 'right'],
   out: ['right', 'bottom', 'top', 'left']
 };
 
-export function freeSlotFor(draft, direction) {
+function occupiedSlots(ports, excluded) {
   const used = new Set();
-  for (const port of draft.ports) {
-    if (port.side && Number.isInteger(port.slot)) {
+  for (const port of ports) {
+    if (port !== excluded && port.side && Number.isInteger(port.slot)) {
       used.add(port.side + ':' + port.slot);
     }
   }
+  return used;
+}
+
+function findFreeSlotOnSide(draft, side, used, byPosition, afterSlot) {
+  const count = slotCount(draft.rows, draft.cols, side);
+  const horizontal = side === 'top' || side === 'bottom';
+  const edgeLength = (horizontal ? draft.cols : draft.rows) * CELL;
+  const cursorPoint = slotOffset(draft.rows, draft.cols, side, afterSlot);
+  const cursorPosition = cursorPoint && (horizontal ? cursorPoint.x : cursorPoint.y);
+  let firstSlot = null;
+  let firstPosition = Infinity;
+  for (let slot = 0; slot < count; slot += 1) {
+    if (used.has(side + ':' + slot)) continue;
+    if (!byPosition) return slot;
+    // 交界槽编号追加在末尾，标注按预览坐标排列。
+    const { x, y } = slotOffset(draft.rows, draft.cols, side, slot);
+    let position = horizontal ? x : y;
+    if (cursorPoint && position <= cursorPosition) position += edgeLength;
+    if (position < firstPosition) {
+      firstPosition = position;
+      firstSlot = slot;
+    }
+  }
+  return firstSlot;
+}
+
+export function firstFreeSlotOnSide(draft, side, excluded) {
+  return findFreeSlotOnSide(draft, side, occupiedSlots(draft.ports, excluded), false);
+}
+
+export function freeSlotFor(draft, direction, excluded) {
+  const used = occupiedSlots(draft.ports, excluded);
   const defaultSides = annotationSides[direction] || ['top', 'bottom', 'left', 'right'];
   const cursor = draft.portPlacementCursors?.[direction];
-  const preferredSide = cursor?.side;
-  const sides = preferredSide
-    ? [preferredSide, ...defaultSides.filter(side => side !== preferredSide)]
+  const sides = cursor
+    ? [cursor.side, ...defaultSides.filter(side => side !== cursor.side)]
     : defaultSides;
   for (const side of sides) {
-    const count = slotCount(draft.rows, draft.cols, side);
-    const horizontal = side === 'top' || side === 'bottom';
-    const edgeLength = (horizontal ? draft.cols : draft.rows) * CELL;
-    const cursorPoint = side === preferredSide && slotOffset(draft.rows, draft.cols, side, cursor.slot);
-    const cursorPosition = cursorPoint && (horizontal ? cursorPoint.x : cursorPoint.y);
-    let firstFree = null;
-    let firstPosition = Infinity;
-    for (let slot = 0; slot < count; slot += 1) {
-      if (used.has(side + ':' + slot)) continue;
-      if (!direction) return { side, slot };
-      // 格子交界槽位的编号排在常规槽位之后，排位按预览坐标。
-      const { x, y } = slotOffset(draft.rows, draft.cols, side, slot);
-      let position = horizontal ? x : y;
-      if (cursorPoint && position <= cursorPosition) position += edgeLength;
-      if (position < firstPosition) {
-        firstPosition = position;
-        firstFree = { side, slot };
-      }
-    }
-    if (firstFree) return firstFree;
+    const afterSlot = side === cursor?.side ? cursor.slot : undefined;
+    const slot = findFreeSlotOnSide(draft, side, used, Boolean(direction), afterSlot);
+    if (slot !== null) return { side, slot };
   }
   return null;
+}
+
+function planDraftPortMove(draft, portId, side, slot) {
+  if (!draft || draft.readOnly) return { status: 'invalid' };
+  const port = draft.ports.find(item => item.id === portId);
+  if (!port || !slotOffset(draft.rows, draft.cols, side, slot)) return { status: 'invalid' };
+  if (draft.ports.some(item => item !== port && item.side === side && item.slot === slot)) {
+    return { status: 'occupied' };
+  }
+  return { status: 'ok', port };
+}
+
+export function checkDraftPortPlacement(draft, portId, side, slot) {
+  return planDraftPortMove(draft, portId, side, slot).status;
+}
+
+export function moveDraftPort(draft, portId, side, slot) {
+  const { status, port } = planDraftPortMove(draft, portId, side, slot);
+  if (status !== 'ok') return status;
+  if (port.side !== side || port.slot !== slot) {
+    draft.portPlacementCursors = { ...draft.portPlacementCursors, [port.direction]: { side, slot } };
+  }
+  port.side = side;
+  port.slot = slot;
+  return 'ok';
 }
 
 export function normalizeDraftPorts(draft) {
@@ -218,9 +378,7 @@ export function normalizeDraftPorts(draft) {
       used.add(port.side + ':' + port.slot);
       continue;
     }
-    const slot = freeSlotFor({ rows: draft.rows, cols: draft.cols, ports: draft.ports.filter(function (item) {
-      return item !== port && item.side && Number.isInteger(item.slot);
-    }) });
+    const slot = freeSlotFor(draft, undefined, port);
     if (slot) {
       port.side = slot.side;
       port.slot = slot.slot;

@@ -1,6 +1,5 @@
 // 封装预览：独立画布命中、缩放、管脚布局与测试。
-import { draftDisplayName, draftTestValues } from "./encapsulation-model.js";
-import { slotOffset } from '../core/geometry.js';
+import { checkDraftPortPlacement, draftDisplayName, draftTestValues } from "./encapsulation-model.js";
 import { drawDefinitionPreview, previewPortSlots, previewZoomBounds } from './view.js';
 
 const PREVIEW_PORT_REVEAL_DELAY_MS = 500;
@@ -10,13 +9,16 @@ export function createPreview(context) {
   let previewPortDrag = null;
   let testPress = null;
   let previewHoverPortId = null;
-  let activeDraft = null;
-  let activeReadOnly;
-  let mode = null;
+  let active = { draft: null, readOnly: undefined, mode: null };
   let revealTimer = null;
 
   function getMode() {
-    return activeDraft === context.app?.draft ? mode : null;
+    return active.draft === context.app?.draft ? active.mode : null;
+  }
+
+  function updateMode(draft, mode) {
+    active = { draft, readOnly: draft?.readOnly, mode };
+    context.updateMode?.(mode, draft);
   }
 
   function resetInteraction() {
@@ -40,10 +42,7 @@ export function createPreview(context) {
     const nextMode = getMode() === tabMode ? null : tabMode;
     resetInteraction();
     context.cancelBoardPortDrag?.();
-    mode = nextMode;
-    activeDraft = draft;
-    activeReadOnly = draft.readOnly;
-    context.updateMode?.(mode, activeDraft);
+    updateMode(draft, nextMode);
     context.app.setPortDrag(null);
   }
 
@@ -57,7 +56,7 @@ export function createPreview(context) {
     };
   }
 
-  function previewPortTarget(draft, clientX, clientY, portId) {
+  function hitPreviewPortSlot(draft, clientX, clientY) {
     if (!draft || draft.readOnly || !context.encapPreview || getMode() !== 'layout') {
       return null;
     }
@@ -81,13 +80,19 @@ export function createPreview(context) {
           side: slot.side,
           slot: slot.slot,
           portId: slot.portId,
-          valid: !slot.portId || slot.portId === portId,
           distance,
           point: slot.point
         };
       }
     }
     return best;
+  }
+
+  function previewPortTarget(draft, clientX, clientY, portId) {
+    const target = hitPreviewPortSlot(draft, clientX, clientY);
+    if (!target) return null;
+    const valid = checkDraftPortPlacement(draft, portId, target.side, target.slot) === 'ok';
+    return { ...target, valid };
   }
 
   function previewPinAt(clientX, clientY) {
@@ -294,45 +299,14 @@ export function createPreview(context) {
     void context.app.editPortLabel(portId);
   }
 
-  function moveDraftPortToSlot(portId, side, slot) {
-    const draft = context.app.draft;
-    if (!draft || draft.readOnly) {
-      return false;
-    }
-    const port = (draft.ports || []).find(function (item) { return item.id === portId; });
-    if (!port) {
-      return false;
-    }
-    if (!slotOffset(draft.rows, draft.cols, side, slot)) {
-      return false;
-    }
-    const occupied = draft.ports.some(function (item) {
-      return item !== port && item.side === side && item.slot === slot;
-    });
-    if (occupied) {
-      context.toast.show('该槽位已被其他管脚占用');
-      return false;
-    }
-    if (port.side !== side || port.slot !== slot) {
-      draft.portPlacementCursors = { ...draft.portPlacementCursors, [port.direction]: { side, slot } };
-    }
-    port.side = side;
-    port.slot = slot;
-    context.syncDraftPanel();
-    return true;
-  }
-
   function renderDraftPreview() {
     if (!context.encapPreview) {
       return;
     }
     const draft = context.app.draft;
-    if (draft !== activeDraft || draft?.readOnly !== activeReadOnly) {
+    if (draft !== active.draft || draft?.readOnly !== active.readOnly) {
       resetInteraction();
-      activeDraft = draft;
-      activeReadOnly = draft?.readOnly;
-      mode = draft && !activeReadOnly ? 'layout' : null;
-      context.updateMode?.(mode, activeDraft);
+      updateMode(draft, draft && !draft.readOnly ? 'layout' : null);
     }
     const rect = context.encapPreview.getBoundingClientRect();
     const width = Math.max(1, Math.round(rect.width));
@@ -358,8 +332,8 @@ export function createPreview(context) {
       ctx.clearRect(0, 0, width, height);
       return;
     }
-    const layout = mode === 'layout';
-    const testing = mode === 'test';
+    const layout = active.mode === 'layout';
+    const testing = active.mode === 'test';
     const values = testing ? draftTestValues(draft) : null;
     const pinValues = values ? { ...values.inputs, ...values.outputs } : null;
     if (values) {
@@ -379,5 +353,5 @@ export function createPreview(context) {
     );
   }
 
-  return { draftPreviewDefinition, getMode, handlePreviewDoubleClick, handlePreviewPointerCancel, handlePreviewPointerDown, handlePreviewPointerLeave, handlePreviewPointerMove, handlePreviewPointerUp, handlePreviewWheel, moveDraftPortToSlot, previewPortTarget, renderDraftPreview, resetInteraction, toggleMode };
+  return { draftPreviewDefinition, getMode, handlePreviewDoubleClick, handlePreviewPointerCancel, handlePreviewPointerDown, handlePreviewPointerLeave, handlePreviewPointerMove, handlePreviewPointerUp, handlePreviewWheel, hitPreviewPortSlot, previewPortTarget, renderDraftPreview, resetInteraction, toggleMode };
 }

@@ -1,5 +1,5 @@
 // 封装面板：DOM 展示与控件同步。
-import { rootDraftOf, draftChainOf, draftDisplayName, draftTestValues } from "./encapsulation-model.js";
+import { rootDraftOf, draftChainOf, draftDisplayName, draftTestValues, PORT_NAME_MAX_LENGTH } from "./encapsulation-model.js";
 import { slotCount, slotOffset } from '../core/geometry.js';
 import { definitionReferenceTree } from './library.js';
 
@@ -114,7 +114,7 @@ export function createPanel(context) {
       const name = document.createElement('input');
       name.type = 'text';
       name.value = port.name;
-      name.maxLength = 40;
+      name.maxLength = PORT_NAME_MAX_LENGTH;
       name.disabled = Boolean(draft.readOnly);
       name.addEventListener('change', function () {
         const value = name.value.trim();

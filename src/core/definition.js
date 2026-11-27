@@ -211,10 +211,12 @@ export function validateDefinitionStructure(candidate, library) {
   } catch (error) {
     return { ok: false, reason: 'INVALID_CIRCUIT', detail: String(error && error.message || error) };
   }
+  const netsById = new Map();
   for (const net of built.nets) {
     if (net.driverPins.length > 1) {
       return { ok: false, reason: 'SECOND_DRIVER', detail: net.id };
     }
+    netsById.set(net.id, net);
   }
   const inputNets = new Set();
   for (const port of candidate.ports) {
@@ -222,7 +224,7 @@ export function validateDefinitionStructure(candidate, library) {
     if (netId === undefined) {
       return { ok: false, reason: 'PORT_UNBOUND', detail: port.id };
     }
-    const net = built.nets.find(candidateNet => candidateNet.id === netId);
+    const net = netsById.get(netId);
     if (!net) {
       return { ok: false, reason: 'PORT_UNBOUND', detail: port.id };
     }

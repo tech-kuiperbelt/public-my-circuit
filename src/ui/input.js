@@ -42,6 +42,7 @@ import {
   attachFreeEnd,
   previewMoveFreeEnd,
   moveFreeEnd,
+  wireJunctionEnd,
   previewCreateFreeWire,
   createFreeWire,
   previewCreateAnchoredFreeWire,
@@ -1302,9 +1303,7 @@ export function attachInput(options) {
       if (hit && hit.point.x === point.x && hit.point.y === point.y) {
         const branchHit = detachJunction ? drag : hit;
         const hostHit = detachJunction ? hit : drag;
-        const branch = state.wires[branchHit.wireId];
-        const end = branchHit.side === 'A' ? branch?.endA : branch?.endB;
-        if (end?.kind === 'junction' && end.wireId === hostHit.wireId) {
+        if (wireJunctionEnd(state, branchHit.wireId, branchHit.side, hostHit.wireId)) {
           return {
             kind: 'collapse-t', point, hover: point, pinAnchor: null,
             signature: 'collapse-t:' + hit.wireId + ':' + hit.side,
