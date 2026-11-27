@@ -1,12 +1,13 @@
 import { createController } from "./ui/encapsulation-controller.js";
 import { createPreview } from "./ui/encapsulation-preview.js";
 import { createPanel } from "./ui/encapsulation-panel.js";
-import { cloneValue, rootDraftOf, draftRuntimeOptions, draftTestValues, invalidateDraftRuntime, evaluateDraft, resolvePortNet, portNetId, freeSlotFor, normalizeDraftPorts, draftHasChanges } from "./ui/encapsulation-model.js";
+import { cloneValue, rootDraftOf, draftRuntimeOptions, draftTestValues, invalidateDraftRuntime, evaluateDraft, resolvePortNet, freeSlotFor, normalizeDraftPorts, draftHasChanges } from "./ui/encapsulation-model.js";
 // 入口：持有 state/view/selection，装配元件栏、工具栏、菜单、toast 与输入。
 import { CLOCK_MAX_PERIOD, CLOCK_MIN_PERIOD } from './core/entities.js';
 import { createState } from './core/state.js';
 import { evaluateDynamic } from './core/dynamic.js';
 import { commitResult } from './core/runtime.js';
+import { bindingNetId } from './core/ports.js';
 import { createSnapshot, prepareSnapshotRestore } from './core/snapshot.js';
 import { createEditHistory, captureDraftHistory, restoreDraftHistory } from './ui/edit-history.js';
 import {
@@ -140,12 +141,13 @@ const boxController = createComponentBoxController({
   store: toolbarLayoutStore,
   systemSlots: COMPONENT_SLOTS,
   getDefinitions: () => app.getDefinitions(),
-  getHiddenTypes: () => componentBar ? componentBar.getHiddenTypes() : [],
+  getHiddenTypes: () => app.draft ? ['CLOCK'] : [],
   onChange: refreshComponentSurfaces
 });
 
 let componentBar = null;
 let componentBox = null;
+let componentInventory = null;
 let iconPicker = null;
 let toolBar = null;
 let session = null;
@@ -604,12 +606,16 @@ const app = {
     }
     let evaluationOptions = { definitions: this.getDefinitions() };
     let updatedPorts;
-    if (this.draft && result?.collapsedWireIds?.length) {
+    if (this.draft && result?.wireEndpointRemaps?.length) {
+      const byWire = new Map(result.wireEndpointRemaps.map(({ wireId, ends }) => [wireId, ends]));
       updatedPorts = this.draft.ports.map(port => {
         const binding = port.binding;
-        return binding?.kind === 'wire' && result.collapsedWireIds.includes(binding.wireId)
-          ? { ...port, binding: { ...binding, wireId: result.id } }
-          : port;
+        const ends = binding?.kind === 'wire' ? byWire.get(binding.wireId) : null;
+        if (!ends) return port;
+        const { end, ...previous } = binding;
+        const next = { ...previous, wireId: result.id };
+        if ((end === 'A' || end === 'B') && ends[end]) next.end = ends[end];
+        return { ...port, binding: next };
       });
     }
     if (this.draft && result?.ok && result.state && !(result.geometryOnly && this.evaluation?.status)) {
@@ -730,17 +736,6 @@ const controller = createController({
   clearWorkbenchPreview,
   get componentBar() {
     return {
-      setDefinitions: function () {
-        refreshComponentSurfaces();
-      },
-      setHiddenTypes: function (types) {
-        if (componentBar) {
-          componentBar.setHiddenTypes(types);
-        }
-        if (componentBox) {
-          componentBox.refresh();
-        }
-      },
       setActive: function (type, definitionId) {
         if (componentBar) {
           componentBar.setActive(type, definitionId);
@@ -751,7 +746,9 @@ const controller = createController({
       }
     };
   },
+  dialog,
   draftInitialView,
+  refreshComponentSurfaces,
   encapClose,
   encapCloseCancel,
   encapCloseDialog,
@@ -849,12 +846,10 @@ function draftPortAnchor(draft, binding) {
     const wire = draft.state.wires[binding.wireId];
     const points = wire && wire.points;
     if (!points || points.length === 0) return null;
-    let point = points[0];
-    if (wire.endA && wire.endA.kind === 'free') {
-      point = points[0];
-    } else if (wire.endB && wire.endB.kind === 'free') {
-      point = points[points.length - 1];
-    }
+    const side = binding.end === 'A' || binding.end === 'B'
+      ? binding.end
+      : (wire.endA?.kind !== 'free' && wire.endB?.kind === 'free' ? 'B' : 'A');
+    const point = side === 'B' ? points[points.length - 1] : points[0];
     return { point, center: null };
   }
   return null;
@@ -989,44 +984,78 @@ function changeDraftSize(rows, cols) {
   app.render();
 }
 
-async function addPortFromPick(binding) {
-  const draft = app.draft;
-  if (!draft) return;
-  if (draft.readOnly) return;
+const PORT_NAME_MAX_LENGTH = 40;
+
+function suggestPortName(ports, direction) {
+  for (let index = ports.length - 1; index >= 0; index -= 1) {
+    const port = ports[index];
+    if (port.direction !== direction) continue;
+    const previousName = port.name.trim();
+    const suffix = /[0-9]+$/.exec(previousName);
+    if (suffix) {
+      const digits = suffix[0];
+      const next = String(BigInt(digits) + 1n).padStart(digits.length, '0');
+      const name = previousName.slice(0, suffix.index) + next;
+      if (name.length <= PORT_NAME_MAX_LENGTH) return name;
+    }
+    break;
+  }
+  return (direction === 'in' ? 'IN' : 'OUT') + (ports.length + 1);
+}
+
+function checkPortPick(draft, binding) {
   const resolved = resolvePortNet(draft, binding);
-  if (!resolved.net) {
-    toast.show('无法解析该连接点的内部 Net');
-    return;
+  const point = draftPortAnchor(draft, binding)?.point;
+  if (!resolved.net || !point) {
+    return { reason: '无法解析该连接点的内部 Net' };
   }
   if (resolved.net.driverPins.length > 1) {
-    toast.show('该 Net 有多个驱动，不能标注');
-    return;
+    return { reason: '该 Net 有多个驱动，不能标注' };
   }
   const direction = resolved.net.driverPins.length === 0 ? 'in' : 'out';
   for (const port of draft.ports) {
-    if (portNetId(draft, port) === resolved.netId) {
-      toast.show('同一个内部 Net 只能对应一个封装管脚');
-      return;
+    if (bindingNetId(resolved.built, port.binding) !== resolved.netId) continue;
+    const existing = draftPortAnchor(draft, port.binding)?.point;
+    if (existing?.x === point.x && existing.y === point.y) {
+      return { reason: '该位置已标注封装管脚' };
+    }
+    if (direction === 'in' && port.direction === 'in') {
+      return { reason: '同一个内部 Net 只能标注一个输入管脚' };
     }
   }
-  const defaultName = (direction === 'in' ? 'IN' : 'OUT') + (draft.ports.length + 1);
+  return { direction };
+}
+
+async function addPortFromPick(binding) {
+  const draft = app.draft;
+  if (!draft || draft.readOnly) return;
+  const { direction, reason } = checkPortPick(draft, binding);
+  if (reason) {
+    toast.show(reason);
+    return;
+  }
   const name = await dialog.prompt({
     title: '标注管脚',
     message: '输入管脚名称',
     label: '名称',
-    value: defaultName,
-    maxLength: 40,
+    value: suggestPortName(draft.ports, direction),
+    maxLength: PORT_NAME_MAX_LENGTH,
     confirmLabel: '确定',
     cancelLabel: '取消'
   });
   if (name === null) return;
   if (app.draft !== draft || draft.readOnly) return;
+  const current = checkPortPick(draft, binding);
+  if (current.direction !== direction) {
+    toast.show(current.reason || '连接点的管脚方向已变化，请重新标注');
+    return;
+  }
   const trimmed = name.trim();
   if (!trimmed) {
     toast.show('管脚名称不能为空');
     return;
   }
-  const slot = freeSlotFor(draft);
+  const slot = freeSlotFor(draft, direction);
   if (!slot) {
     toast.show('当前尺寸没有空余槽位，请增加行数或列数');
     return;
@@ -1046,6 +1075,9 @@ async function addPortFromPick(binding) {
       side: slot.side,
       slot: slot.slot
     });
+    if (draft.portPlacementCursors?.[direction]?.side === slot.side) {
+      draft.portPlacementCursors[direction] = slot;
+    }
     if (direction === 'in') draft.inputs[id] = 0;
   });
   syncDraftPanel();
@@ -1097,27 +1129,16 @@ function changePortSide(port, side) {
     syncDraftPanel();
     return;
   }
-  app.editDraftHistory(() => {
-    port.side = side;
-    port.slot = target;
-  });
-  syncDraftPanel();
+  moveDraftPortToSlot(port.id, side, target);
 }
 
 function changePortSlot(port, slot) {
   const draft = app.draft;
   if (!draft) return;
   if (draft.readOnly) return;
-  const used = new Set(draft.ports.filter(function (item) {
-    return item !== port && item.side && Number.isInteger(item.slot);
-  }).map(function (item) { return item.side + ':' + item.slot; }));
-  if (used.has(port.side + ':' + slot)) {
-    toast.show('该槽位已被其他管脚占用');
+  if (!moveDraftPortToSlot(port.id, port.side, slot)) {
     syncDraftPanel();
-    return;
   }
-  app.editDraftHistory(() => { port.slot = slot; });
-  syncDraftPanel();
 }
 
 async function editClockPeriod(componentId) {
@@ -1448,8 +1469,6 @@ function closeEncapsulationEditor(...args) { return controller.closeEncapsulatio
 
 function saveEncapsulationEditor(...args) { return controller.saveEncapsulationEditor(...args); }
 
-function deleteDefinitionFromBar(...args) { return controller.deleteDefinitionFromBar(...args); }
-
 app.onAnnotatePick = function (pick) {
   if (!app.draft || app.draft.readOnly) return undefined;
   return addPortFromPick(pick.binding);
@@ -1501,6 +1520,7 @@ encapCols.addEventListener('change', function () {
 function resize() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
+  componentBar.refreshCapacity();
   syncSideTabsTop();
   hidePinTooltip();
   app.render();
@@ -1571,12 +1591,9 @@ function setBoxOnTop(onTop) {
 }
 
 function refreshComponentSurfaces() {
-  if (componentBar) {
-    componentBar.setInventoryContext(app.getDefinitions(), boxController.getLayout().hidden);
-  }
-  if (componentBox) {
-    componentBox.refresh();
-  }
+  componentInventory = boxController.getInventory();
+  componentBar?.setItems(componentInventory.toolbarItems);
+  componentBox?.refresh();
 }
 
 async function renameBoxTab(pageIndex, currentLabel) {
@@ -1609,16 +1626,22 @@ function addBoxTab() { return boxController.addTab(); }
 function deleteBoxTab(pageIndex) { return boxController.deleteTab(pageIndex); }
 function moveBoxItemToTab(item, targetPage) {
   if (!item || item.kind !== 'custom') return false;
-  const source = boxController.getInventory().positions[item.key];
-  if (source && source.page === targetPage) return false;
-  const moved = boxController.moveToTab(item.key, targetPage);
-  if (!moved) toast.show('目标页签已满，无法放入该元件');
-  return moved;
+  const result = boxController.moveToTab(item.key, targetPage);
+  if (result === 'unavailable') toast.show('目标页签已满，无法放入该元件');
+  return result === 'moved';
 }
 function moveBoxItem(item, page, cell) {
   return item && boxController.move(item.key, page, cell);
 }
-function pinToolbarItem(item) { return item && boxController.pin(item.key); }
+function canPinToolbarItem(item) {
+  return boxController.canPin(item.key, componentBar.getCapacity(), componentInventory);
+}
+
+function pinToolbarItem(item) {
+  const result = boxController.pin(item.key, componentBar.refreshCapacity());
+  if (result === 'full') toast.show('元件栏已满');
+  return result === 'pinned';
+}
 function removeToolbarItem(type, definitionId) {
   boxController.unpin(itemKey(type, definitionId));
   if (input && input.cancelWire) {
@@ -1636,7 +1659,7 @@ function removeToolbarItem(type, definitionId) {
   }
 }
 
-function openCustomDefinitionMenu(item, event) {
+function openCustomDefinitionMenu(item, event, { allowDelete = false } = {}) {
   const definitionId = item.definitionId;
   const menuItems = [
     {
@@ -1650,10 +1673,12 @@ function openCustomDefinitionMenu(item, event) {
       onSelect: function () { removeToolbarItem(item.type, definitionId); }
     });
   }
-  menuItems.push({
-    label: '删除定义',
-    onSelect: function () { void deleteDefinitionFromBar(definitionId); }
-  });
+  if (allowDelete) {
+    menuItems.push({
+      label: '删除定义',
+      onSelect: function () { void controller.deleteDefinition(definitionId); }
+    });
+  }
   menu.openAt(event.clientX, event.clientY, menuItems);
 }
 
@@ -1868,8 +1893,7 @@ componentBar = createComponentBar(componentsElement, {
     }]);
   }
 });
-componentBar.setHiddenKeys(boxController.getLayout().hidden);
-componentBar.setActive(null);
+refreshComponentSurfaces();
 
 componentBox = createComponentBox({
   toggle: componentBoxToggleElement,
@@ -1878,7 +1902,7 @@ componentBox = createComponentBox({
   tabsPrev: componentBoxTabsPrevElement,
   tabsNext: componentBoxTabsNextElement,
   page: componentBoxPageElement,
-  getInventory: () => boxController.getInventory(),
+  getInventory: () => componentInventory,
   getPendingItem: () => boxController.getLayout().pendingNewItem,
   canMarkSeen: function () {
     return !app.draft ||
@@ -1900,13 +1924,16 @@ componentBox = createComponentBox({
     }
     placeFromComponentBar(item.type, clientX, clientY, keepActive, item.definitionId);
   },
+  canPin: canPinToolbarItem,
   onPin: pinToolbarItem,
   onMove: moveBoxItem,
   onMoveToTab: moveBoxItemToTab,
   onRenameTab: renameBoxTab,
   onAddTab: addBoxTab,
   onDeleteTab: deleteBoxTab,
-  onDefinitionContextMenu: openCustomDefinitionMenu,
+  onDefinitionContextMenu: function (item, event) {
+    openCustomDefinitionMenu(item, event, { allowDelete: true });
+  },
   onDefinitionDoubleClick: openEncapsulationEditor
 });
 componentBox.setActive(null);
@@ -2061,8 +2088,11 @@ session = createSessionController({
       view: { scale: 2, pan: { x: 100, y: 100 } }
     };
   },
-  applyLibrary: function (library) {
+  applyLibrary: function (library, { importedDefinitionIds } = {}) {
+    boxController.syncLayout();
     app.setLibrary(library);
+    if (importedDefinitionIds?.length &&
+        boxController.limitImportedPins(importedDefinitionIds, componentBar.refreshCapacity())) return;
     refreshComponentSurfaces();
   }
 });
@@ -2153,7 +2183,7 @@ if (encapTab) {
 }
 if (encapPreview) {
   for (const [mode, button] of encapPreviewTabs) {
-    button.addEventListener('click', () => preview.setMode(mode));
+    button.addEventListener('click', () => preview.toggleMode(mode));
   }
   encapPreview.addEventListener('pointerdown', handlePreviewPointerDown);
   encapPreview.addEventListener('pointermove', handlePreviewPointerMove);

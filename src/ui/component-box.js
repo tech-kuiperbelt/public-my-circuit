@@ -2,8 +2,7 @@
 // 箱子按 tab 分页，每页固定 10 行 × 16 列；系统元件在“系统”页且不可删除，
 // 自定义元件从第 2 页开始。从箱子拖到左侧元件栏即可固定该元件。
 import { resolveComponentDropTarget } from './component-drop-target.js';
-import { COMPONENT_SLOTS } from './toolbar.js';
-import { BOX_PAGE_SIZE, buildInventory } from './component-inventory.js';
+import { BOX_PAGE_SIZE } from './component-inventory.js';
 
 // 简笔线稿箱子：关闭时盖子合上，打开时盖子抬起并露出深色箱口。
 const BOX_CLOSED_ICON = `
@@ -64,18 +63,7 @@ export function createComponentBox(options) {
   let seenTimer = null;
   let scheduledKey = null;
 
-  function inventory() {
-    if (opts.getInventory) return opts.getInventory();
-    return buildInventory({
-      systemSlots: COMPONENT_SLOTS,
-      definitions: opts.getDefinitions ? opts.getDefinitions() : null,
-      hiddenKeys: opts.getHiddenKeys ? opts.getHiddenKeys() : [],
-      hiddenTypes: opts.getHiddenTypes ? opts.getHiddenTypes() : [],
-      positions: opts.getPositions ? opts.getPositions() : null,
-      tabLabels: opts.getTabLabels ? opts.getTabLabels() : null,
-      customPages: opts.getCustomPages ? opts.getCustomPages() : null
-    });
-  }
+  const inventory = opts.getInventory;
 
   function pendingKey() {
     return opts.getPendingItem ? opts.getPendingItem() : null;
@@ -320,7 +308,7 @@ export function createComponentBox(options) {
       const targetTab = target.kind === 'tab' && item.kind === 'custom' ? target.element : null;
       const bar = toolbarElement();
       if (bar) {
-        bar.classList.toggle('box-drop-target', overToolbar);
+        bar.classList.toggle('box-drop-target', overToolbar && (!opts.canPin || opts.canPin(item)));
       }
       setHoverCell(targetCell);
       setHoverTab(targetTab);

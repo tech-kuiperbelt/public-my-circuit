@@ -2332,6 +2332,8 @@ function collapseJunctionsAfterSegmentDrag(state, wireId, moved, branches, defin
   if (!collapses.length) return null;
 
   const draft = clone(state);
+  const retainedEnds = { A: 'A', B: 'B' };
+  const wireEndpointRemaps = [{ wireId, ends: retainedEnds }];
   for (const { id, points } of [{ id: wireId, points: moved.points }, ...branches]) {
     if (points.length < 2) return reject(REASONS.ILLEGAL_GEOMETRY);
     draft.wires[id] = draggedWire(draft.wires[id], points);
@@ -2339,6 +2341,8 @@ function collapseJunctionsAfterSegmentDrag(state, wireId, moved, branches, defin
   for (const { side, hostId, hostSide } of collapses) {
     const host = draft.wires[hostId];
     if (!host || !joinWireCorner(draft, wireId, side, hostId, hostSide)) return reject(REASONS.ILLEGAL_GEOMETRY);
+    retainedEnds[side] = null;
+    wireEndpointRemaps.push(splicedWireEnds(hostId, hostSide, side));
     originalEnds[side === 'A' ? 0 : 1] = endpointPoint(host.points, hostSide === 'B');
   }
   const originals = [[wireId, originalEnds], ...branches.map(({ id }) => [id, state.wires[id].points])];
@@ -2346,7 +2350,7 @@ function collapseJunctionsAfterSegmentDrag(state, wireId, moved, branches, defin
   if (!check.ok) return check;
   return {
     ok: true, state: draft, points: draft.wires[wireId].points, delta: moved.delta, branches,
-    collapsedWireIds: collapses.map(({ hostId }) => hostId)
+    collapsedWireIds: collapses.map(({ hostId }) => hostId), wireEndpointRemaps
   };
 }
 
@@ -2433,7 +2437,8 @@ export function dragWireSegment(state, wireId, segmentIndex, offset, definitionO
   if (preview.state) {
     return {
       ok: true, state: preview.state, id: wireId, points: preview.points, delta: preview.delta,
-      branches: preview.branches, collapsedWireIds: preview.collapsedWireIds
+      branches: preview.branches, collapsedWireIds: preview.collapsedWireIds,
+      wireEndpointRemaps: preview.wireEndpointRemaps
     };
   }
   const draft = clone(state);
@@ -2451,8 +2456,16 @@ function wireEnd(wire, side) {
   return side === 'A' ? wire.endA : wire.endB;
 }
 
+// 拼接消耗本端，另一端接替新导线的指定端点。
+function splicedWireEnds(wireId, consumedEnd, survivingEnd) {
+  return { wireId, ends: {
+    A: consumedEnd === 'A' ? null : survivingEnd,
+    B: consumedEnd === 'B' ? null : survivingEnd
+  } };
+}
+
 function wirePlanPreview(plan) {
-  const { state: _draft, collapsedWireIds: _collapsedWireIds, ...preview } = plan;
+  const { state: _draft, collapsedWireIds: _collapsedWireIds, wireEndpointRemaps: _remaps, ...preview } = plan;
   return preview;
 }
 
@@ -2463,7 +2476,13 @@ function planWireCorner(state, wireId, side, otherId, otherSide, points, definit
   const joined = draft.wires[wireId].points;
   const checked = validateWireChanges(draft, [[wireId, joined]], definitionOptions);
   return checked.ok
-    ? { ok: true, state: draft, id: wireId, removedId: otherId, points: joined, collapsedWireIds: [otherId] }
+    ? {
+      ok: true, state: draft, id: wireId, removedId: otherId, points: joined, collapsedWireIds: [otherId],
+      wireEndpointRemaps: [
+        splicedWireEnds(wireId, side, side === 'A' ? 'B' : 'A'),
+        splicedWireEnds(otherId, otherSide, side)
+      ]
+    }
     : checked;
 }
 
@@ -3191,6 +3210,10 @@ export function mergeFreeEnds(state, wireId, side, targetWireId, targetSide, def
     state: plan.state,
     id: wireId,
     removedId: plan.removeWireId,
-    points: plan.points
+    points: plan.points,
+    wireEndpointRemaps: [
+      splicedWireEnds(wireId, side, 'A'),
+      splicedWireEnds(targetWireId, targetSide, 'B')
+    ]
   };
 }

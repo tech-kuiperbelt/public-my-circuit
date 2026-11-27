@@ -82,10 +82,10 @@ function nearestPinWhere(state, view, world, wantConnected, definitionOptions = 
   return best;
 }
 
-// 标注管脚：优先未连接的元件引脚，其次悬空导线端点。
+// 标注管脚：寻找最近的元件引脚或悬空导线端点，同距离时优先引脚。
 export function nearestAnnotatable(state, view, world, definitionOptions = {}) {
   const tolerance = hitTolerance(view);
-  const pin = nearestPinWhere(state, view, world, false, { definitions: definitionOptions.definitions });
+  const pin = nearestPinWhere(state, view, world, undefined, definitionOptions);
   let best = pin ? {
     binding: { kind: 'pin', componentId: pin.anchor.componentId, pinId: pin.anchor.pinId },
     point: pin.anchor.point,
@@ -96,8 +96,8 @@ export function nearestAnnotatable(state, view, world, definitionOptions = {}) {
     const points = wire && wire.points;
     if (!points || points.length < 2) continue;
     const ends = [
-      { end: wire.endA, point: points[0] },
-      { end: wire.endB, point: points[points.length - 1] }
+      { side: 'A', end: wire.endA, point: points[0] },
+      { side: 'B', end: wire.endB, point: points[points.length - 1] }
     ];
     for (const item of ends) {
       if (!item.end || item.end.kind !== 'free') continue;
@@ -105,7 +105,7 @@ export function nearestAnnotatable(state, view, world, definitionOptions = {}) {
       if (dist > tolerance) continue;
       if (!best || dist < best.dist) {
         best = {
-          binding: { kind: 'wire', wireId },
+          binding: { kind: 'wire', wireId, end: item.side },
           point: { x: item.point.x, y: item.point.y },
           dist
         };

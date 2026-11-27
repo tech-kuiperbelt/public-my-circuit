@@ -1661,7 +1661,7 @@ export function attachInput(options) {
       if (pick && app.onAnnotatePick) {
         app.onAnnotatePick(pick);
       } else {
-        toast.show('请点击未连接的元件管脚或悬空导线端点');
+        toast.show('请点击元件管脚或悬空导线端点');
       }
       return;
     }

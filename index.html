@@ -68,6 +68,7 @@ layout: null
       display: none;
     }
     #components {
+      --component-bar-item-height: 44px;
       position: fixed;
       left: 0;
       top: 0;
@@ -81,7 +82,7 @@ layout: null
       align-items: center;
       background: rgba(24, 24, 24, 0.96);
       border-right: 1px solid #333;
-      overflow-y: auto;
+      overflow: clip;
       z-index: 10;
       user-select: none;
     }
@@ -383,6 +384,9 @@ layout: null
       width: 22px;
       height: 22px;
       pointer-events: none;
+    }
+    #components .bar-item {
+      height: var(--component-bar-item-height);
     }
     #components .bar-item svg {
       width: 26px;
@@ -1841,7 +1845,7 @@ layout: null
             <canvas id="encap-preview" class="encap-preview" aria-label="元件外观预览" title="元件外观预览"></canvas>
           </div>
           <div id="encap-preview-tabs" class="encap-actions" role="group" aria-label="元件预览模式">
-            <button id="encap-preview-layout" type="button" aria-pressed="true" aria-controls="encap-port-section">布局</button>
+            <button id="encap-preview-layout" type="button" aria-pressed="false" aria-controls="encap-port-section">布局</button>
             <button id="encap-preview-test" type="button" aria-pressed="false" aria-controls="encap-input-section">测试</button>
             <button id="encap-preview-references" type="button" aria-pressed="false" aria-controls="encap-reference-section">被引用</button>
           </div>
@@ -1850,7 +1854,7 @@ layout: null
           <button id="encap-annotate" type="button">标注管脚</button>
           <button id="encap-remove-port" type="button">移除管脚</button>
         </div>
-        <div id="encap-port-section" role="region" aria-labelledby="encap-preview-layout">
+        <div id="encap-port-section" role="region" aria-labelledby="encap-preview-layout" hidden>
           <div id="encap-ports"></div>
         </div>
         <div id="encap-input-section" role="region" aria-labelledby="encap-preview-test" hidden>

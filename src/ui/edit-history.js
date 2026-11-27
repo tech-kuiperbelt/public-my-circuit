@@ -52,7 +52,7 @@ export function createEditHistory(limit = 10) {
 
 const DRAFT_FIELDS = Object.freeze([
   'state', 'evaluation', 'name', 'icon', 'rows', 'cols',
-  'ports', 'inputs', 'nextPortNumber'
+  'ports', 'inputs', 'nextPortNumber', 'portPlacementCursors'
 ]);
 
 export function captureDraftHistory(draft) {

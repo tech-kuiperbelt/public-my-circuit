@@ -94,7 +94,7 @@ export function createPanel(context) {
     if (draft.ports.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'encap-hint';
-      empty.textContent = '尚未标注管脚。点击“标注管脚”，再点击未连接管脚或悬空线端点。';
+      empty.textContent = '尚未标注管脚。点击“标注管脚”，再点击元件管脚或悬空线端点。';
       context.encapPorts.appendChild(empty);
       return;
     }

@@ -1,5 +1,5 @@
 // 封装草稿的纯数据操作；不依赖 DOM 或应用实例。
-import { slotCount, slotOffset } from "../core/geometry.js";
+import { CELL, slotCount, slotOffset } from "../core/geometry.js";
 import { evaluateDynamic } from "../core/dynamic.js";
 import { buildNets } from "../core/nets.js";
 import { bindingNetId, bindingValue } from "../core/ports.js";
@@ -165,24 +165,45 @@ export function resolvePortNet(draft, binding) {
   };
 }
 
-export function portNetId(draft, port) {
-  return resolvePortNet(draft, port.binding).netId;
-}
+const annotationSides = {
+  in: ['left', 'top', 'bottom', 'right'],
+  out: ['right', 'bottom', 'top', 'left']
+};
 
-export function freeSlotFor(draft) {
+export function freeSlotFor(draft, direction) {
   const used = new Set();
   for (const port of draft.ports) {
     if (port.side && Number.isInteger(port.slot)) {
       used.add(port.side + ':' + port.slot);
     }
   }
-  for (const side of ['top', 'bottom', 'left', 'right']) {
+  const defaultSides = annotationSides[direction] || ['top', 'bottom', 'left', 'right'];
+  const cursor = draft.portPlacementCursors?.[direction];
+  const preferredSide = cursor?.side;
+  const sides = preferredSide
+    ? [preferredSide, ...defaultSides.filter(side => side !== preferredSide)]
+    : defaultSides;
+  for (const side of sides) {
     const count = slotCount(draft.rows, draft.cols, side);
+    const horizontal = side === 'top' || side === 'bottom';
+    const edgeLength = (horizontal ? draft.cols : draft.rows) * CELL;
+    const cursorPoint = side === preferredSide && slotOffset(draft.rows, draft.cols, side, cursor.slot);
+    const cursorPosition = cursorPoint && (horizontal ? cursorPoint.x : cursorPoint.y);
+    let firstFree = null;
+    let firstPosition = Infinity;
     for (let slot = 0; slot < count; slot += 1) {
-      if (!used.has(side + ':' + slot)) {
-        return { side, slot };
+      if (used.has(side + ':' + slot)) continue;
+      if (!direction) return { side, slot };
+      // 格子交界槽位的编号排在常规槽位之后，排位按预览坐标。
+      const { x, y } = slotOffset(draft.rows, draft.cols, side, slot);
+      let position = horizontal ? x : y;
+      if (cursorPoint && position <= cursorPosition) position += edgeLength;
+      if (position < firstPosition) {
+        firstPosition = position;
+        firstFree = { side, slot };
       }
     }
+    if (firstFree) return firstFree;
   }
   return null;
 }

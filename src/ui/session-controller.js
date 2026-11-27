@@ -210,11 +210,11 @@ export function createSessionController(options = {}) {
     };
   }
 
-  function applyLibraryState(definitions, revision) {
+  function applyLibraryState(definitions, revision, change) {
     library = { definitions: definitions && typeof definitions === 'object' ? definitions : {} };
     libraryRevision = Number.isInteger(revision) && revision >= 0 ? revision : 0;
     libraryReady = true;
-    applyLibrary(library);
+    applyLibrary(library, change);
   }
 
   function prepareLibrary(record) {
@@ -1145,7 +1145,9 @@ export function createSessionController(options = {}) {
         };
       }
       if (result.library) {
-        applyLibraryState(result.library.definitions, result.library.revision);
+        applyLibraryState(result.library.definitions, result.library.revision, {
+          importedDefinitionIds: plan.addedDefinitionIds
+        });
       }
       if (result.session) {
         lastRevision = result.session.revision;

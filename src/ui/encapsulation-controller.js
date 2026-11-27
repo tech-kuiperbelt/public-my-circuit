@@ -159,8 +159,7 @@ export function createController(context) {
     context.app.placeDefinitionId = null;
     context.app.tool = null;
     for (const key of Object.keys(context.app.overlay)) context.app.overlay[key] = null;
-    context.componentBar.setDefinitions(draft.library);
-    if (context.componentBar.setHiddenTypes) context.componentBar.setHiddenTypes(['CLOCK']);
+    context.refreshComponentSurfaces();
     context.componentBar.setActive(null);
     context.toolBar.setActive(null);
     context.syncDraftPanel();
@@ -246,8 +245,7 @@ export function createController(context) {
     draft.baseline = captureDraftBaseline(draft);
     context.app.state = draft.state;
     context.app.evaluation = draft.evaluation;
-    context.componentBar.setDefinitions(draft.library);
-    if (context.componentBar.setHiddenTypes) context.componentBar.setHiddenTypes(['CLOCK']);
+    context.refreshComponentSurfaces();
     context.componentBar.setActive(null);
     context.syncDraftPanel();
     context.clearWorkbenchPreview();
@@ -343,8 +341,7 @@ export function createController(context) {
     const previous = draft.previous;
     context.app.draft = parent;
     restoreEditorWorkspace(context.app, previous);
-    context.componentBar.setDefinitions(parent.library);
-    if (context.componentBar.setHiddenTypes) context.componentBar.setHiddenTypes(['CLOCK']);
+    context.refreshComponentSurfaces();
     context.componentBar.setActive(
       context.app.mode === 'place' ? context.app.placeType : null,
       context.app.placeDefinitionId
@@ -372,8 +369,7 @@ export function createController(context) {
     context.clearWorkbenchPreview();
     context.app.draft = null;
     restoreEditorWorkspace(context.app, draft.previous);
-    context.componentBar.setDefinitions(context.app.library);
-    if (context.componentBar.setHiddenTypes) context.componentBar.setHiddenTypes([]);
+    context.refreshComponentSurfaces();
     context.componentBar.setActive(
       context.app.mode === 'place' ? context.app.placeType : null,
       context.app.placeDefinitionId
@@ -470,13 +466,23 @@ export function createController(context) {
     }
   }
 
-  async function deleteDefinitionFromBar(definitionId) {
+  async function deleteDefinition(definitionId) {
     if (context.app.draft) {
       context.toast.show(context.app.draft.readOnly ? '请先关闭封装详情' : '请先保存或取消封装编辑');
       return;
     }
-    if (!context.session) return;
-    const result = await context.session.deleteDefinition(definitionId);
+    const session = context.session;
+    if (!session) return;
+    const name = session.getLibrary().definitions[definitionId]?.name || definitionId;
+    const confirmed = await context.dialog.confirm({
+      title: '删除定义',
+      message: '确定删除自定义元件「' + name + '」？',
+      confirmLabel: '删除',
+      danger: true
+    });
+    if (!confirmed || context.app.draft) return;
+
+    const result = await session.deleteDefinition(definitionId);
     if (result.ok) {
       context.toast.show('定义已删除');
     } else {
@@ -484,5 +490,5 @@ export function createController(context) {
     }
   }
 
-  return { cancelEncapCloseDialog, closeEncapsulationEditor, deleteDefinitionFromBar, discardEncapCloseDialog, openEncapsulationEditor, requestCloseEncapsulationEditor, saveEncapCloseDialog, saveEncapsulationEditor, switchEncapsulationToEdit };
+  return { cancelEncapCloseDialog, closeEncapsulationEditor, deleteDefinition, discardEncapCloseDialog, openEncapsulationEditor, requestCloseEncapsulationEditor, saveEncapCloseDialog, saveEncapsulationEditor, switchEncapsulationToEdit };
 }

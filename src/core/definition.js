@@ -216,24 +216,25 @@ export function validateDefinitionStructure(candidate, library) {
       return { ok: false, reason: 'SECOND_DRIVER', detail: net.id };
     }
   }
-  const portNets = new Map();
+  const inputNets = new Set();
   for (const port of candidate.ports) {
     const netId = bindingNetId(built, port.binding);
     if (netId === undefined) {
       return { ok: false, reason: 'PORT_UNBOUND', detail: port.id };
     }
-    if (portNets.has(netId)) {
-      return { ok: false, reason: 'DUPLICATE_PORT_NET', detail: port.id };
-    }
-    portNets.set(netId, port.id);
     const net = built.nets.find(candidateNet => candidateNet.id === netId);
     if (!net) {
       return { ok: false, reason: 'PORT_UNBOUND', detail: port.id };
     }
-    if (port.direction === 'in' && net.driverPins.length !== 0) {
-      return { ok: false, reason: 'INPUT_PORT_DRIVEN', detail: port.id };
-    }
-    if (port.direction === 'out' && net.driverPins.length !== 1) {
+    if (port.direction === 'in') {
+      if (net.driverPins.length !== 0) {
+        return { ok: false, reason: 'INPUT_PORT_DRIVEN', detail: port.id };
+      }
+      if (inputNets.has(netId)) {
+        return { ok: false, reason: 'DUPLICATE_PORT_NET', detail: port.id };
+      }
+      inputNets.add(netId);
+    } else if (net.driverPins.length !== 1) {
       return { ok: false, reason: 'OUTPUT_PORT_UNDRIVEN', detail: port.id };
     }
   }

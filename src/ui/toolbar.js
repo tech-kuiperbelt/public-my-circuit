@@ -2,7 +2,6 @@
 // 顶部 = 工具：点击产生动作或切换模式（删除等）。
 // 左侧 = meta 元件/工具：系统内建定义的图标；线也是元件（特殊：点击进入画线/接线模式）。
 // 元件拖到图纸上创建真实实例；元件栏只显示已固定项，完整集合由箱子管理。
-import { buildInventory } from './component-inventory.js';
 const NEW_ICON = `
 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
      stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
@@ -356,38 +355,21 @@ function buildCells(container, slots, options) {
 
 export function createComponentBar(container, options) {
   const handlers = options || {};
-  let definitions = { definitions: {} };
+  let items = [];
   let activeType = null;
   let activeDefinitionId = null;
-  const hiddenTypes = new Set();
-  let hiddenKeys = new Set();
-
-  function inventory() {
-    return buildInventory({
-      systemSlots: COMPONENT_SLOTS,
-      definitions,
-      hiddenKeys,
-      hiddenTypes
-    });
+  function measureCapacity() {
+    const style = getComputedStyle(container);
+    const itemHeight = parseFloat(style.getPropertyValue('--component-bar-item-height'));
+    const gap = parseFloat(style.rowGap);
+    const height = container.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    return Math.max(0, Math.floor((height + gap) / (itemHeight + gap)));
   }
 
-  function slots() {
-    return inventory().toolbarItems.map(function (item) {
-      return {
-        type: item.type,
-        definitionId: item.definitionId,
-        key: item.key,
-        label: item.label,
-        title: item.title,
-        icon: item.icon,
-        custom: item.kind === 'custom'
-      };
-    });
-  }
-
+  let capacity = measureCapacity();
   let bar = null;
   function render() {
-    bar = buildCells(container, slots(), Object.assign({}, handlers, {
+    bar = buildCells(container, items.slice(0, capacity), Object.assign({}, handlers, {
       titleSuffix: '（按住 Ctrl/Cmd 可连续放置；右键可移出元件栏）'
     }));
     if (bar) bar.setActive(activeType, activeDefinitionId);
@@ -395,40 +377,24 @@ export function createComponentBar(container, options) {
 
   render();
   return {
+    getCapacity: () => capacity,
+    refreshCapacity() {
+      const next = measureCapacity();
+      if (capacity !== next) {
+        capacity = next;
+        render();
+      }
+      return capacity;
+    },
     setActive(type, definitionId) {
       activeType = type || null;
       activeDefinitionId = definitionId || null;
       if (bar) bar.setActive(activeType, activeDefinitionId);
     },
-    setInventoryContext(library, keys) {
-      definitions = library && library.definitions ? library : { definitions: {} };
-      hiddenKeys = new Set(Array.from(keys || []).filter(key => typeof key === 'string' && key));
+    setItems(nextItems) {
+      items = nextItems;
       render();
-    },
-    setDefinitions(library) {
-      definitions = library && library.definitions ? library : { definitions: {} };
-      render();
-    },
-    setHiddenTypes(types) {
-      hiddenTypes.clear();
-      for (const type of types || []) {
-        hiddenTypes.add(type);
-      }
-      render();
-    },
-    setHiddenKeys(keys) {
-      hiddenKeys = new Set();
-      for (const key of keys || []) {
-        if (typeof key === 'string' && key) {
-          hiddenKeys.add(key);
-        }
-      }
-      render();
-    },
-    getHiddenTypes() {
-      return Array.from(hiddenTypes);
-    },
-    getInventory: inventory
+    }
   };
 }
 

@@ -26,7 +26,7 @@ export const MIN_SCALE = 0.5;
 export const MAX_SCALE = 6;
 
 const BRIDGE_SPAN = WIRE_GRID / 2;
-const BRIDGE_LIFT = WIRE_GRID * 0.4;
+const BRIDGE_LIFT = WIRE_GRID * 0.3;
 
 const PIN_LABEL_FONT = '10px sans-serif';
 const PIN_LABEL_GAP = 6;

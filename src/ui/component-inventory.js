@@ -436,9 +436,9 @@ export function createToolbarLayoutStore(storage) {
     return { hidden: [], positions: {}, tabLabels: {}, customPages: 1, pendingNewItem: null };
   }
 
-  function readRecord() {
+  function readLatestLayout() {
     if (!target || typeof target.getItem !== 'function') {
-      return emptyRecord();
+      return null;
     }
     try {
       const raw = target.getItem(TOOLBAR_LAYOUT_STORAGE_KEY);
@@ -447,7 +447,7 @@ export function createToolbarLayoutStore(storage) {
       }
       const parsed = JSON.parse(raw);
       if (!parsed || (parsed.version !== 1 && parsed.version !== 2)) {
-        return emptyRecord();
+        return null;
       }
       return {
         hidden: Array.isArray(parsed.hidden) ? normalizeHiddenKeys(parsed.hidden) : [],
@@ -457,8 +457,12 @@ export function createToolbarLayoutStore(storage) {
         pendingNewItem: parsed.version === 2 ? normalizePendingItem(parsed.pendingNewItem) : null
       };
     } catch (error) {
-      return emptyRecord();
+      return null;
     }
+  }
+
+  function readRecord() {
+    return readLatestLayout() || emptyRecord();
   }
 
   function writeRecord(record) {
@@ -532,6 +536,7 @@ export function createToolbarLayoutStore(storage) {
 
   return {
     loadLayout: readRecord,
+    readLatestLayout,
     saveLayout: writeRecord,
     load,
     loadPositions,
